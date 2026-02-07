@@ -1,0 +1,73 @@
+name: nyota_app
+description: Une version mini de Nyota avec TikTok-Like, chat et vente
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # UI & utilitaires
+  video_player: ^2.8.2
+  share_plus: ^12.0.0
+  provider: ^6.1.2
+  flutter_svg: ^2.0.9
+  image_picker: ^1.1.1
+  uuid: ^4.5.1
+  shared_preferences: ^2.3.3
+  crypto: ^3.0.6
+  qr_flutter: ^4.1.0
+  screenshot: ^3.0.0
+  permission_handler: ^11.2.0
+  encrypt: ^5.0.1
+  flutter_secure_storage: ^8.0.0
+  video_thumbnail: ^0.5.6
+  flutter_image_compress: ^2.1.0
+  app_links: ^6.1.1
+
+  # Firebase (versions stables compatibles)
+  firebase_core: ^3.7.0
+  firebase_auth: ^5.7.0
+  cloud_firestore: ^5.0.0
+  firebase_storage: ^12.0.0
+  firebase_app_check: ^0.3.0+4
+  firebase_messaging: ^15.0.1
+  flutter_local_notifications: ^17.2.0
+  supabase_flutter: ^2.3.4
+  http: ^1.2.0
+  cached_network_image: ^3.2.3
+  rxdart: ^0.27.7
+  video_compress: ^3.1.2
+
+  # Connexion & stockage local
+  connectivity_plus: ^5.0.2
+  path_provider: ^2.1.5
+  hive: ^2.2.3
+  hive_flutter: ^1.1.0
+
+  # Géolocalisation
+  geolocator: ^12.0.0
+  geocoding: ^3.0.0
+  cupertino_icons: ^1.0.8
+
+  # File picker
+  file_picker: ^8.1.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+  hive_generator: ^2.0.1
+  build_runner: ^2.4.8
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/videos/
+    - assets/images/avatar.png
+    - assets/images/
+    - assets/icons/comment.svg
