@@ -1,0 +1,702 @@
+import 'package:flutter/material.dart';
+import 'package:share_plus/share_plus.dart';
+import 'package:image_picker/image_picker.dart';
+import 'dart:io';
+
+void main() {
+  runApp(NyotaApp());
+}
+
+// =================== MAIN APP ===================
+class NyotaApp extends StatefulWidget {
+  @override
+  _NyotaAppState createState() => _NyotaAppState();
+}
+
+class _NyotaAppState extends State<NyotaApp> {
+  String? currentUser;
+  Map<String, String> users = {}; // email -> password
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Nyota',
+      theme: ThemeData(primarySwatch: Colors.deepPurple),
+      home: currentUser == null
+          ? AuthPage(
+              users: users,
+              onLogin: (userEmail) {
+                setState(() => currentUser = userEmail);
+              },
+            )
+          : HomePage(
+              currentUser: currentUser!,
+              onLogout: () {
+                setState(() => currentUser = null);
+              },
+            ),
+    );
+  }
+}
+
+// =================== AUTH PAGE ===================
+class AuthPage extends StatefulWidget {
+  final Map<String, String> users; // email -> password
+  final Function(String) onLogin;
+
+  const AuthPage({super.key, required this.users, required this.onLogin});
+
+  @override
+  State<AuthPage> createState() => _AuthPageState();
+}
+
+class _AuthPageState extends State<AuthPage> {
+  bool isLogin = true;
+  String? selectedUser;
+  final _formKey = GlobalKey<FormState>();
+  String email = '';
+  String password = '';
+  String errorMessage = '';
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text(isLogin ? "Connexion" : "Inscription")),
+      body: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            if (errorMessage.isNotEmpty)
+              Text(errorMessage, style: const TextStyle(color: Colors.red)),
+
+            // Connexion rapide avec comptes existants
+            if (widget.users.isNotEmpty && isLogin)
+              Column(
+                children: [
+                  const Text("Se connecter avec un compte existant :"),
+                  const SizedBox(height: 8),
+                  DropdownButton<String>(
+                    hint: const Text('Sélectionner un compte'),
+                    value: selectedUser,
+                    items: widget.users.keys
+                        .map((e) => DropdownMenuItem(
+                              value: e,
+                              child: Text(e),
+                            ))
+                        .toList(),
+                    onChanged: (val) {
+                      setState(() {
+                        selectedUser = val!;
+                        widget.onLogin(selectedUser!); // connexion directe
+                      });
+                    },
+                  ),
+                  const SizedBox(height: 16),
+                ],
+              ),
+
+            Form(
+              key: _formKey,
+              child: Column(
+                children: [
+                  TextFormField(
+                    decoration: const InputDecoration(labelText: "Email"),
+                    onChanged: (val) => email = val.trim(),
+                    validator: (val) => val!.isEmpty ? "Entrez un email" : null,
+                  ),
+                  const SizedBox(height: 16),
+                  TextFormField(
+                    obscureText: true,
+                    decoration: const InputDecoration(labelText: "Mot de passe"),
+                    onChanged: (val) => password = val,
+                    validator: (val) =>
+                        val!.length < 4 ? "Au moins 4 caractères" : null,
+                  ),
+                  const SizedBox(height: 24),
+                  ElevatedButton(
+                    child: Text(isLogin ? "Se connecter" : "S’inscrire"),
+                    onPressed: () {
+                      if (_formKey.currentState!.validate()) {
+                        if (isLogin) {
+                          if (!widget.users.containsKey(email)) {
+                            setState(() {
+                              errorMessage =
+                                  "Compte inexistant. Veuillez vous inscrire d'abord.";
+                            });
+                          } else if (widget.users[email] != password) {
+                            setState(() {
+                              errorMessage = "Mot de passe incorrect.";
+                            });
+                          } else {
+                            widget.onLogin(email);
+                          }
+                        } else {
+                          if (widget.users.containsKey(email)) {
+                            setState(() {
+                              errorMessage =
+                                  "Un compte avec cet email existe déjà";
+                            });
+                          } else {
+                            widget.users[email] = password;
+                            widget.onLogin(email);
+                          }
+                        }
+                      }
+                    },
+                  ),
+                  TextButton(
+                    child: Text(isLogin ? "Créer un compte" : "J’ai déjà un compte"),
+                    onPressed: () => setState(() {
+                      isLogin = !isLogin;
+                      errorMessage = '';
+                    }),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// =================== MODELS ===================
+class Product {
+  String name;
+  File? media;
+  int likes;
+  bool isFavorite;
+  List<String> comments;
+  double price;
+
+  Product({
+    required this.name,
+    this.media,
+    this.likes = 0,
+    this.isFavorite = false,
+    this.price = 10.0,
+    List<String>? comments,
+  }) : comments = comments ?? [];
+}
+
+class Transaction {
+  String description;
+  double amount;
+  DateTime date;
+
+  Transaction(
+      {required this.description, required this.amount, required this.date});
+}
+
+// =================== HOME PAGE ===================
+class HomePage extends StatefulWidget {
+  final String currentUser;
+  final VoidCallback onLogout;
+
+  const HomePage(
+      {super.key, required this.currentUser, required this.onLogout});
+
+  @override
+  _HomePageState createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> {
+  int _currentIndex = 0;
+
+  int pointsFidelite = 0;
+  int commandesRecues = 0;
+  int commandesNonRecues = 0;
+  int commandesEnAttente = 0;
+
+  double walletBalance = 50.0;
+  List<Transaction> transactions = [];
+
+  final ImagePicker _picker = ImagePicker();
+  bool isSeller = false;
+  String shopName = '';
+  String phoneNumber = '';
+  String email = '';
+  String location = '';
+  List<Product> products = [];
+
+  List<Product> feedProducts = List.generate(
+      12, (i) => Product(name: 'Produit ${i + 1}', price: (i + 1) * 5.0));
+
+  List<Product> cart = [];
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('Nyota - ${widget.currentUser}'),
+        actions: [
+          IconButton(
+              onPressed: widget.onLogout, icon: const Icon(Icons.logout))
+        ],
+      ),
+      body: _getBody(),
+      bottomNavigationBar: BottomNavigationBar(
+        currentIndex: _currentIndex,
+        onTap: (index) => setState(() => _currentIndex = index),
+        type: BottomNavigationBarType.fixed,
+        items: const [
+          BottomNavigationBarItem(icon: Icon(Icons.home), label: 'Feed'),
+          BottomNavigationBarItem(icon: Icon(Icons.store), label: 'Catalogue'),
+          BottomNavigationBarItem(icon: Icon(Icons.person), label: 'Profil'),
+          BottomNavigationBarItem(
+              icon: Icon(Icons.shopping_cart), label: 'Panier'),
+          BottomNavigationBarItem(
+              icon: Icon(Icons.account_balance_wallet), label: 'Wallet'),
+        ],
+      ),
+    );
+  }
+
+  Widget _getBody() {
+    switch (_currentIndex) {
+      case 0:
+        return _buildFeed();
+      case 1:
+        return _buildCatalog();
+      case 2:
+        return _buildProfil();
+      case 3:
+        return _buildCart();
+      case 4:
+        return _buildWallet();
+      default:
+        return _buildFeed();
+    }
+  }
+
+  // ===== FEED =====
+  Widget _buildFeed() {
+    return ListView.builder(
+      padding: const EdgeInsets.all(12),
+      itemCount: feedProducts.length,
+      itemBuilder: (context, index) {
+        Product product = feedProducts[index];
+        return Card(
+          margin: const EdgeInsets.symmetric(vertical: 8),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(product.name,
+                  style: const TextStyle(
+                      fontSize: 18, fontWeight: FontWeight.bold)),
+              Text('\$${product.price.toStringAsFixed(2)}',
+                  style: const TextStyle(fontSize: 16, color: Colors.green)),
+              const SizedBox(height: 8),
+              Container(
+                height: 150,
+                color: Colors.grey[300],
+                child: product.media != null
+                    ? Image.file(product.media!, fit: BoxFit.cover)
+                    : const Center(child: Icon(Icons.image)),
+              ),
+              Row(
+                children: [
+                  IconButton(
+                    icon: Icon(Icons.thumb_up,
+                        color: product.likes > 0 ? Colors.blue : Colors.grey),
+                    onPressed: () => setState(() => product.likes += 1),
+                  ),
+                  Text('${product.likes}'),
+                  IconButton(
+                    icon: Icon(product.isFavorite
+                        ? Icons.bookmark
+                        : Icons.bookmark_border),
+                    onPressed: () =>
+                        setState(() => product.isFavorite = !product.isFavorite),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.share),
+                    onPressed: () =>
+                        Share.share('Regarde ce produit : ${product.name}'),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.chat),
+                    onPressed: () => _openChat(product),
+                  ),
+                  ElevatedButton(
+                      onPressed: () {
+                        setState(() => cart.add(product));
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(
+                              content: Text('${product.name} ajouté au panier')),
+                        );
+                      },
+                      child: const Text('Ajouter au panier'))
+                ],
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  // ===== CATALOGUE 6 COLONNES =====
+  Widget _buildCatalog() {
+    return GridView.builder(
+      padding: const EdgeInsets.all(8),
+      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: 6,
+        crossAxisSpacing: 8,
+        mainAxisSpacing: 8,
+        childAspectRatio: 0.7,
+      ),
+      itemCount: feedProducts.length,
+      itemBuilder: (context, index) {
+        Product product = feedProducts[index];
+        return Card(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Expanded(
+                child: product.media != null
+                    ? Image.file(product.media!, fit: BoxFit.cover)
+                    : const Center(child: Icon(Icons.image, size: 30)),
+              ),
+              Padding(
+                padding: const EdgeInsets.all(4.0),
+                child: Column(
+                  children: [
+                    Text(product.name,
+                        style: const TextStyle(fontWeight: FontWeight.bold),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis),
+                    Text('\$${product.price.toStringAsFixed(2)}',
+                        style: const TextStyle(color: Colors.green)),
+                    ElevatedButton(
+                        onPressed: () {
+                          setState(() => cart.add(product));
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                                content:
+                                    Text('${product.name} ajouté au panier')),
+                          );
+                        },
+                        child: const Text('Ajouter')),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+// =================== PROFIL ===================
+  Widget _buildProfil() {
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        const CircleAvatar(radius: 50, backgroundImage: AssetImage('assets/images/avatar.png')),
+        const SizedBox(height: 16),
+        Text(widget.currentUser, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold), textAlign: TextAlign.center),
+        const SizedBox(height: 24),
+        _buildStat('Points de fidélité', pointsFidelite.toString()),
+        _buildStat('Commandes reçues', commandesRecues.toString()),
+        _buildStat('Commandes non reçues', commandesNonRecues.toString()),
+        _buildStat('Commandes en attente', commandesEnAttente.toString()),
+        const SizedBox(height: 24),
+
+        // ===== BOUTON VENDRE =====
+        if (!isSeller)
+          ElevatedButton.icon(
+            icon: const Icon(Icons.add_shopping_cart),
+            label: const Text('Activer Vendre'),
+            onPressed: _activateSellerProfile,
+          )
+        else ...[
+          ElevatedButton.icon(
+            icon: const Icon(Icons.store),
+            label: const Text('Gérer mes publications'),
+            onPressed: () {
+              showDialog(
+                context: context,
+                builder: (context) => AlertDialog(
+                  title: const Text('Mes publications'),
+                  content: SizedBox(
+                    width: double.maxFinite,
+                    child: ListView(
+                      children: products.map((p) => ListTile(
+                        leading: p.media != null ? Image.file(p.media!, width: 50, height: 50, fit: BoxFit.cover) : const Icon(Icons.image),
+                        title: Text(p.name),
+                      )).toList(),
+                    ),
+                  ),
+                  actions: [
+                    TextButton(onPressed: () => Navigator.pop(context), child: const Text('Fermer')),
+                    ElevatedButton.icon(
+                      icon: const Icon(Icons.camera_alt),
+                      label: const Text('Ajouter photo/vidéo'),
+                      onPressed: _pickMedia,
+                    ),
+                  ],
+                ),
+              );
+            },
+          )
+        ]
+      ],
+    );
+  }
+
+  Widget _buildStat(String titre, String valeur) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4.0),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [Text(titre, style: const TextStyle(fontSize: 16)), Text(valeur, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold))],
+      ),
+    );
+  }
+
+  void _activateSellerProfile() {
+    TextEditingController shopController = TextEditingController();
+    TextEditingController phoneController = TextEditingController();
+    TextEditingController emailController = TextEditingController();
+    TextEditingController locationController = TextEditingController();
+    bool acceptedConditions = false;
+
+    showDialog(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setStateDialog) => AlertDialog(
+          title: const Text('Conditions d’utilisation'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text(
+                  "- Commissions : 10%.\n"
+                  "- Je m'engage à livrer les produits.\n"
+                  "- Produits non conformes : remboursement intégral et sanctions.\n"
+                  "- Produits conformes mais refusés : aucun remboursement.\n"
+                  "- Ajouter téléphone, email et localisation (obligatoire).\n"
+                  "- Nom de la boutique facultatif.",
+                ),
+                const SizedBox(height: 12),
+                TextField(controller: shopController, decoration: const InputDecoration(labelText: 'Nom de la boutique (facultatif)')),
+                TextField(controller: phoneController, decoration: const InputDecoration(labelText: 'Téléphone *')),
+                TextField(controller: emailController, decoration: const InputDecoration(labelText: 'Email *')),
+                TextField(controller: locationController, decoration: const InputDecoration(labelText: 'Localisation *')),
+                Row(
+                  children: [
+                    Checkbox(
+                      value: acceptedConditions,
+                      onChanged: (val) => setStateDialog(() => acceptedConditions = val ?? false),
+                    ),
+                    const Expanded(child: Text('J’accepte les conditions d’utilisation')),
+                  ],
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context), child: const Text('Annuler')),
+            ElevatedButton(
+              onPressed: acceptedConditions &&
+                      phoneController.text.isNotEmpty &&
+                      emailController.text.isNotEmpty &&
+                      locationController.text.isNotEmpty
+                  ? () {
+                      setState(() {
+                        shopName = shopController.text;
+                        phoneNumber = phoneController.text;
+                        email = emailController.text;
+                        location = locationController.text;
+                        isSeller = true;
+                      });
+                      Navigator.pop(context);
+                    }
+                  : null,
+              child: const Text('Accepter'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _pickMedia() async {
+    final XFile? media = await _picker.pickImage(
+      source: ImageSource.camera,
+      maxHeight: 1080,
+      maxWidth: 1920,
+    );
+    if (media != null) {
+      setState(() {
+        products.add(Product(name: 'Publication ${products.length + 1}', media: File(media.path), price: 20.0));
+      });
+    }
+  }
+
+  // =================== PANIER ===================
+  Widget _buildCart() {
+    double total = cart.fold(0, (sum, item) => sum + item.price);
+
+    return Padding(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        children: [
+          Expanded(
+            child: ListView.builder(
+              itemCount: cart.length,
+              itemBuilder: (context, index) {
+                Product item = cart[index];
+                return ListTile(
+                  leading: item.media != null ? Image.file(item.media!, width: 50, height: 50, fit: BoxFit.cover) : const Icon(Icons.image),
+                  title: Text(item.name),
+                  subtitle: Text('\$${item.price.toStringAsFixed(2)}'),
+                  trailing: IconButton(
+                    icon: const Icon(Icons.remove_circle, color: Colors.red),
+                    onPressed: () {
+                      setState(() {
+                        cart.removeAt(index);
+                      });
+                    },
+                  ),
+                );
+              },
+            ),
+          ),
+          Text('Total: \$${total.toStringAsFixed(2)}', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 16),
+          ElevatedButton(
+            onPressed: cart.isEmpty
+                ? null
+                : () {
+                    if (walletBalance >= total) {
+                      setState(() {
+                        walletBalance -= total;
+                        for (var item in cart) {
+                          transactions.add(Transaction(
+                              description: 'Commande reçue: ${item.name}',
+                              amount: item.price,
+                              date: DateTime.now()));
+                        }
+                        commandesRecues += cart.length;
+                        pointsFidelite += (total ~/ 10);
+                        cart.clear();
+                        commandesEnAttente = 0;
+                      });
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('Paiement effectué, commandes reçues!')),
+                      );
+                    } else {
+                      setState(() {
+                        commandesEnAttente += cart.length;
+                        for (var item in cart) {
+                          transactions.add(Transaction(
+                              description: 'Commande en attente: ${item.name}',
+                              amount: item.price,
+                              date: DateTime.now()));
+                        }
+                      });
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('Solde insuffisant, commandes en attente!')),
+                      );
+                    }
+                  },
+            child: const Text('Payer le panier'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // =================== WALLET ===================
+  Widget _buildWallet() {
+    return Padding(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        children: [
+          Text('Solde: \$${walletBalance.toStringAsFixed(2)}', style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 16),
+          ElevatedButton(onPressed: _addMoney, child: const Text('Ajouter de l’argent')),
+          const SizedBox(height: 16),
+          const Text('Historique des transactions', style: TextStyle(fontSize: 18)),
+          Expanded(
+            child: ListView.builder(
+              itemCount: transactions.length,
+              itemBuilder: (context, index) {
+                Transaction tx = transactions[index];
+                return ListTile(
+                  title: Text(tx.description),
+                  subtitle: Text('${tx.date}'),
+                  trailing: Text('\$${tx.amount.toStringAsFixed(2)}'),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _addMoney() {
+    TextEditingController amountController = TextEditingController();
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Ajouter de l’argent'),
+        content: TextField(
+          controller: amountController,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(labelText: 'Montant'),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Annuler')),
+          ElevatedButton(
+            onPressed: () {
+              setState(() {
+                double amount = double.tryParse(amountController.text) ?? 0;
+                if (amount > 0) {
+                  walletBalance += amount;
+                  transactions.add(Transaction(description: 'Ajout de fonds', amount: amount, date: DateTime.now()));
+                }
+              });
+              Navigator.pop(context);
+            },
+            child: const Text('Ajouter'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // =================== CHAT PRODUIT ===================
+  void _openChat(Product product) {
+    TextEditingController chatController = TextEditingController();
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text('Chat sur ${product.name}'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              height: 100,
+              child: ListView(children: product.comments.map((c) => Text(c)).toList()),
+            ),
+            TextField(controller: chatController, decoration: const InputDecoration(labelText: 'Écrire un commentaire')),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Fermer')),
+          ElevatedButton(
+              onPressed: () {
+                setState(() => product.comments.add(chatController.text));
+                Navigator.pop(context);
+              },
+              child: const Text('Envoyer')),
+        ],
+      ),
+    );
+  }
+}
