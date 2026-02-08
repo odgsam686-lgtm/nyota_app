@@ -221,11 +221,11 @@ async function runTranscode(
     console.error(e?.cause);
     throw e;
   }
-  log("FETCHING URL:", signedUrl);
-  log("FETCHING URL (worker):", signedUrl);
-  log("FETCHING URL LENGTH:", signedUrl.length);
-  log("FETCHING URL HTTPS:", signedUrl.startsWith("https://"));
-  log("FETCHING URL TYPE:", typeof signedUrl);
+  log("SIGNED URL CHECK", {
+    length: signedUrl.length,
+    https: signedUrl.startsWith("https://"),
+    type: typeof signedUrl,
+  });
   if (!signedUrl || !signedUrl.startsWith("https://")) {
     throw new Error("Invalid signedUrl");
   }
@@ -293,7 +293,6 @@ async function fetchNextJob() {
   const host = new URL(SUPABASE_URL).hostname;
   log("FETCH URL =", url);
   log("FETCH HOST =", host);
-  log("FETCH HEADERS =", headers);
   try {
     const res = await fetchWithRetry(url, { headers });
     if (!res.ok) {
@@ -354,6 +353,10 @@ async function workerLoop() {
 }
 
 const server = http.createServer(async (req, res) => {
+  if (req.method === "GET" && (req.url ?? "") === "/") {
+    res.writeHead(200, { "content-type": "text/plain" }).end("ok");
+    return;
+  }
   if (req.method === "GET" && req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true, ts: new Date().toISOString(), version: "1.0.0" }));
@@ -380,73 +383,105 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
-  if (req.method !== "POST" || req.url !== "/webhooks/storage") {
+  if (req.method !== "POST" || (req.url ?? "") !== "/webhooks/storage") {
     res.writeHead(404).end("not found");
     return;
   }
 
   const secret = req.headers["x-webhook-secret"];
   if (!secret || secret !== WEBHOOK_SECRET) {
+    log("[WEBHOOK] invalid secret");
     res.writeHead(401).end("unauthorized");
     return;
   }
 
   let body = "";
   req.on("data", (chunk) => (body += chunk));
-  req.on("end", async () => {
+  req.on("end", () => {
+    let payload: any = {};
     try {
-      const payload = JSON.parse(body);
-      const record = payload.record ?? payload;
-
-      const bucket = record.bucket_id ?? record.bucket ?? BUCKET;
-      const sourceName =
-        record.name ??
-        record.media_path ??
-        record.media_url ??
-        payload.name ??
-        payload.media_path ??
-        payload.media_url;
-      const contentType = record.content_type ?? payload.content_type ?? "";
-
-      if (!sourceName) {
-        res.writeHead(400).end("missing name");
-        return;
-      }
-      if (bucket !== BUCKET) {
-        res.writeHead(200).end("ignored bucket");
-        return;
-      }
-      if (shouldIgnore(sourceName)) {
-        res.writeHead(200).end("ignored path");
-        return;
-      }
-      if (!isLikelyVideo(sourceName, contentType)) {
-        res.writeHead(200).end("not video");
-        return;
-      }
-
-      const objectName = normalizeObjectName(bucket, sourceName);
-      const requestId = record.id ?? record.object_id ?? objectName;
-      logStep({ requestId }, "webhook_received");
-
-      if (MODE === "direct") {
-        runTranscode(bucket, sourceName, contentType, { requestId }).catch((e) =>
-          logStep({ requestId }, "job_failed", e?.message || e),
-        );
-      } else {
-        await enqueueJob(bucket, objectName);
-      }
-
-      res.writeHead(202).end("accepted");
+      payload = body ? JSON.parse(body) : {};
     } catch (e: any) {
-      logStep({}, "job_failed", e?.message || e);
-      console.error(e?.stack);
-      res.writeHead(500).end("error");
+      log("[WEBHOOK] invalid json");
+      res.writeHead(400).end("invalid json");
+      return;
+    }
+
+    const record = payload.record ?? payload.new ?? payload;
+    const bucket = record.bucket_id ?? record.bucket ?? BUCKET;
+    const sourceName =
+      record.name ??
+      record.media_path ??
+      record.media_url ??
+      payload.name ??
+      payload.media_path ??
+      payload.media_url;
+    const contentType =
+      record.content_type ??
+      record.metadata?.mimetype ??
+      payload.content_type ??
+      "";
+    const eventType =
+      payload.type ?? payload.eventType ?? payload.event ?? "unknown";
+
+    const requestId =
+      record.id ?? record.object_id ?? record?.name ?? "unknown";
+
+    log("[WEBHOOK] received", {
+      requestId,
+      bucket_id: bucket,
+      name: sourceName,
+      mimetype: contentType,
+      eventType,
+    });
+
+    if (!sourceName) {
+      log("[WEBHOOK] rejected (missing name)");
+      res.writeHead(202).end("accepted");
+      return;
+    }
+    if (bucket !== BUCKET) {
+      log("[WEBHOOK] ignored (bucket mismatch)", { bucket });
+      res.writeHead(202).end("accepted");
+      return;
+    }
+    if (shouldIgnore(sourceName)) {
+      log("[WEBHOOK] ignored (path)", { sourceName });
+      res.writeHead(202).end("accepted");
+      return;
+    }
+    if (!isLikelyVideo(sourceName, contentType)) {
+      log("[WEBHOOK] ignored (not video)", { sourceName, contentType });
+      res.writeHead(202).end("accepted");
+      return;
+    }
+
+    res.writeHead(202).end("accepted");
+
+    const objectName = normalizeObjectName(bucket, sourceName);
+    const ctx = { requestId };
+
+    if (MODE === "direct") {
+      setImmediate(() => {
+        runTranscode(bucket, sourceName, contentType, ctx).catch((e) => {
+          log("[WEBHOOK] job_failed", e?.message || e);
+          console.error(e?.stack);
+        });
+      });
+    } else {
+      setImmediate(() => {
+        enqueueJob(bucket, objectName)
+          .then(() => log("[WEBHOOK] job enqueued", { requestId }))
+          .catch((e) => {
+            log("[WEBHOOK] enqueue failed", e?.message || e);
+            console.error(e?.stack);
+          });
+      });
     }
   });
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, "0.0.0.0", () => {
   log(`API listening on :${PORT} (mode=${MODE})`);
 });
 
