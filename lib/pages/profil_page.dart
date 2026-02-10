@@ -1,6 +1,7 @@
 // pages/profil_page.dart
 import 'dart:async';
 import 'dart:io';
+import 'dart:math';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
@@ -40,6 +41,7 @@ class _ProfilPageState extends State<ProfilPage> with RouteAware {
   final Set<String> _publishingDraftIds = {};
   bool _isOffline = false;
   late final StreamSubscription<ConnectivityResult> _connectivitySub;
+  final Random _rand = Random();
 
   Map<String, dynamic>? userData;
   bool loading = true;
@@ -272,12 +274,67 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
     throw Exception("Utilisateur non connecté");
   }
 
-  return await Supabase.instance.client
+  final user = await Supabase.instance.client
       .from('users')
       .select()
       .eq('firebase_uid', firebaseUser.uid)
       .single();
+
+  final profile = await Supabase.instance.client
+      .from('public_profiles')
+      .select('username')
+      .eq('user_id', firebaseUser.uid)
+      .maybeSingle();
+
+  if (profile != null && profile['username'] != null) {
+    user['username'] = profile['username'];
+  }
+
+  return user;
 }
+
+  String _normalizeUsername(String input) {
+    final lower = input.toLowerCase();
+    final noAccents = lower
+        .replaceAll(RegExp(r'[àáâäãå]'), 'a')
+        .replaceAll(RegExp(r'[ç]'), 'c')
+        .replaceAll(RegExp(r'[èéêë]'), 'e')
+        .replaceAll(RegExp(r'[ìíîï]'), 'i')
+        .replaceAll(RegExp(r'[ñ]'), 'n')
+        .replaceAll(RegExp(r'[òóôöõ]'), 'o')
+        .replaceAll(RegExp(r'[ùúûü]'), 'u')
+        .replaceAll(RegExp(r'[ýÿ]'), 'y');
+    final cleaned = noAccents.replaceAll(RegExp(r'[^a-z0-9]'), '');
+    return cleaned;
+  }
+
+  String _randomDigits(int count) {
+    final buffer = StringBuffer();
+    for (int i = 0; i < count; i++) {
+      buffer.write(_rand.nextInt(10));
+    }
+    return buffer.toString();
+  }
+
+  Future<String> _generateUniqueUsername(String displayName, String uid) async {
+    final base = _normalizeUsername(displayName);
+    final root = base.isNotEmpty ? base : 'user';
+
+    for (int i = 0; i < 6; i++) {
+      final candidate = i == 0 ? root : '$root${_randomDigits(4)}';
+      final res = await supabase
+          .from('public_profiles')
+          .select('user_id')
+          .eq('username', candidate)
+          .limit(1);
+
+      if (res.isEmpty || res.first['user_id'] == uid) {
+        return candidate;
+      }
+    }
+
+    return '$root${DateTime.now().millisecondsSinceEpoch % 100000}';
+  }
 
 
   Future<String?> generateAndUploadThumbnail(File videoFile, String postId) async {
@@ -374,9 +431,9 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
   File? _pendingAvatar;
   bool _uploadingAvatar = false;
 
-  Future<void> _pickAndUploadPhoto() async {
+  Future<void> _pickAndUploadPhoto(ImageSource source) async {
     final XFile? file = await picker.pickImage(
-      source: ImageSource.camera, // ✅ CAMÉRA
+      source: source,
       imageQuality: 70,
       maxWidth: 1024,
     );
@@ -401,6 +458,13 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
       await supabase.from('users').update({
         'photo_url': avatarUrl,
       }).eq('firebase_uid', userId!);
+
+      // ✅ SYNC public_profiles
+      await supabase.from('public_profiles').upsert({
+        'user_id': userId!,
+        'avatar_url': avatarUrl,
+        'updated_at': DateTime.now().toIso8601String(),
+      });
 
       if (!mounted) return;
 
@@ -516,6 +580,12 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
         'photo_url': null,
       }).eq('firebase_uid', userId!);
 
+      await supabase.from('public_profiles').upsert({
+        'user_id': userId!,
+        'avatar_url': null,
+        'updated_at': DateTime.now().toIso8601String(),
+      });
+
       if (!mounted) return;
 
       setState(() {
@@ -532,54 +602,160 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
     }
   }
 
+  void _showAvatarOptionsSheet() {
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (_) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.photo_library),
+              title: const Text("Galerie"),
+              onTap: () {
+                Navigator.pop(context);
+                _pickAndUploadPhoto(ImageSource.gallery);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.photo_camera),
+              title: const Text("Appareil photo"),
+              onTap: () {
+                Navigator.pop(context);
+                _pickAndUploadPhoto(ImageSource.camera);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.delete),
+              title: const Text("Supprimer la photo"),
+              onTap: () {
+                Navigator.pop(context);
+                _deleteAvatar();
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.close),
+              title: const Text("Annuler"),
+              onTap: () => Navigator.pop(context),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Future<void> _editDisplayName() async {
     final controller = TextEditingController(text: displayName);
+    bool saving = false;
+    String? errorText;
 
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
       builder: (_) {
-        return Padding(
-          padding: EdgeInsets.only(
-            left: 16,
-            right: 16,
-            top: 16,
-            bottom: MediaQuery.of(context).viewInsets.bottom + 16,
-          ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Text(
-                "Modifier le nom",
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+        return StatefulBuilder(
+          builder: (context, setModalState) {
+            void validate(String value) {
+              final trimmed = value.trim();
+              if (trimmed.isEmpty || trimmed.length < 2) {
+                errorText = "Minimum 2 caractères";
+              } else if (trimmed.length > 30) {
+                errorText = "Maximum 30 caractères";
+              } else {
+                errorText = null;
+              }
+            }
+
+            validate(controller.text);
+
+            return Padding(
+              padding: EdgeInsets.only(
+                left: 16,
+                right: 16,
+                top: 16,
+                bottom: MediaQuery.of(context).viewInsets.bottom + 16,
               ),
-              TextField(
-                controller: controller,
-                decoration: const InputDecoration(
-                  hintText: "Entrez votre nom",
-                ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    "Modifier le nom",
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                  TextField(
+                    controller: controller,
+                    onChanged: (v) {
+                      setModalState(() {
+                        validate(v);
+                      });
+                    },
+                    decoration: InputDecoration(
+                      hintText: "Entrez votre nom",
+                      errorText: errorText,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  ElevatedButton(
+                    onPressed: (errorText != null || saving)
+                        ? null
+                        : () async {
+                            final value = controller.text.trim();
+                            setModalState(() => saving = true);
+                            try {
+                              await supabase.from('users').update({
+                                'display_name': value,
+                              }).eq('firebase_uid', userId!);
+
+                              final profile = await supabase
+                                  .from('public_profiles')
+                                  .select('username')
+                                  .eq('user_id', userId!)
+                                  .maybeSingle();
+                              final existingUsername =
+                                  profile?['username']?.toString().trim();
+                              final usernameToSave = (existingUsername == null ||
+                                      existingUsername.isEmpty)
+                                  ? await _generateUniqueUsername(
+                                      value, userId!)
+                                  : existingUsername;
+
+                              await supabase.from('public_profiles').upsert({
+                                'user_id': userId!,
+                                'display_name': value,
+                                'username': usernameToSave,
+                                'updated_at': DateTime.now().toIso8601String(),
+                              });
+
+                              if (!mounted) return;
+                              setState(() {
+                                displayName = value;
+                              });
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(
+                                    content: Text("✅ Nom mis à jour")),
+                              );
+                              Navigator.pop(context);
+                            } catch (e) {
+                              if (mounted) {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(content: Text("Erreur: $e")),
+                                );
+                              }
+                            } finally {
+                              if (mounted) {
+                                setModalState(() => saving = false);
+                              }
+                            }
+                          },
+                    child: Text(saving ? "Enregistrement..." : "Enregistrer"),
+                  ),
+                ],
               ),
-              const SizedBox(height: 12),
-              ElevatedButton(
-                onPressed: () async {
-                  final value = controller.text.trim();
-
-                  await supabase.from('users').update({
-                    'display_name': value,
-                  }).eq('firebase_uid', userId!);
-
-                  if (!mounted) return;
-
-                  setState(() {
-                    displayName = value;
-                  });
-
-                  Navigator.pop(context);
-                },
-                child: const Text("Enregistrer"),
-              ),
-            ],
-          ),
+            );
+          },
         );
       },
     );
@@ -587,53 +763,112 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
 
   Future<void> _editBio() async {
     final controller = TextEditingController(text: bio);
+    bool saving = false;
+    String? errorText;
 
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
       builder: (_) {
-        return Padding(
-          padding: EdgeInsets.only(
-            left: 16,
-            right: 16,
-            top: 16,
-            bottom: MediaQuery.of(context).viewInsets.bottom + 16,
-          ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Text(
-                "Modifier la bio",
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+        return StatefulBuilder(
+          builder: (context, setModalState) {
+            void validate(String value) {
+              final trimmed = value.trim();
+              if (trimmed.length > 120) {
+                errorText = "Maximum 120 caractères";
+              } else {
+                errorText = null;
+              }
+            }
+
+            validate(controller.text);
+
+            return Padding(
+              padding: EdgeInsets.only(
+                left: 16,
+                right: 16,
+                top: 16,
+                bottom: MediaQuery.of(context).viewInsets.bottom + 16,
               ),
-              TextField(
-                controller: controller,
-                maxLength: 80,
-                decoration: const InputDecoration(
-                  hintText: "Parlez de vous",
-                ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Text(
+                    "Modifier la bio",
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                  TextField(
+                    controller: controller,
+                    maxLength: 120,
+                    onChanged: (v) {
+                      setModalState(() {
+                        validate(v);
+                      });
+                    },
+                    decoration: InputDecoration(
+                      hintText: "Parlez de vous",
+                      errorText: errorText,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  ElevatedButton(
+                    onPressed: (errorText != null || saving)
+                        ? null
+                        : () async {
+                            final value = controller.text.trim();
+                            setModalState(() => saving = true);
+                            try {
+                              await supabase.from('users').update({
+                                'bio': value,
+                              }).eq('firebase_uid', userId!);
+
+                              final profile = await supabase
+                                  .from('public_profiles')
+                                  .select('username')
+                                  .eq('user_id', userId!)
+                                  .maybeSingle();
+                              final existingUsername =
+                                  profile?['username']?.toString().trim();
+                              final usernameToSave = (existingUsername == null ||
+                                      existingUsername.isEmpty)
+                                  ? await _generateUniqueUsername(
+                                      displayName ?? userId!, userId!)
+                                  : existingUsername;
+
+                              await supabase.from('public_profiles').upsert({
+                                'user_id': userId!,
+                                'bio': value,
+                                'username': usernameToSave,
+                                'updated_at': DateTime.now().toIso8601String(),
+                              });
+
+                              if (!mounted) return;
+                              setState(() {
+                                bio = value;
+                              });
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(
+                                    content: Text("✅ Bio mise à jour")),
+                              );
+                              Navigator.pop(context);
+                            } catch (e) {
+                              if (mounted) {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(content: Text("Erreur: $e")),
+                                );
+                              }
+                            } finally {
+                              if (mounted) {
+                                setModalState(() => saving = false);
+                              }
+                            }
+                          },
+                    child: Text(saving ? "Enregistrement..." : "Enregistrer"),
+                  ),
+                ],
               ),
-              const SizedBox(height: 12),
-              ElevatedButton(
-                onPressed: () async {
-                  final value = controller.text.trim();
-
-                  await supabase.from('users').update({
-                    'bio': value,
-                  }).eq('firebase_uid', userId!);
-
-                  if (!mounted) return;
-
-                  setState(() {
-                    bio = value;
-                  });
-
-                  Navigator.pop(context);
-                },
-                child: const Text("Enregistrer"),
-              ),
-            ],
-          ),
+            );
+          },
         );
       },
     );
@@ -933,7 +1168,6 @@ Widget build(BuildContext context) {
 
       return Scaffold(
         appBar: AppBar(
-          title: const Text("Mon Profil"),
           actions: [
             IconButton(
               icon: const Icon(Icons.more_vert),
@@ -955,26 +1189,114 @@ Widget build(BuildContext context) {
           children: [
             /// 🔹 AVATAR
             Center(
-              child: CircleAvatar(
-                radius: 55,
-                backgroundImage: userData['photo_url'] != null
-                    ? NetworkImage(userData['photo_url'])
-                    : const AssetImage("assets/images/avatar.png")
-                        as ImageProvider,
+              child: Stack(
+                children: [
+                  CircleAvatar(
+                    radius: 55,
+                    backgroundImage: userData['photo_url'] != null
+                        ? NetworkImage(userData['photo_url'])
+                        : const AssetImage("assets/images/avatar.png")
+                            as ImageProvider,
+                  ),
+                  Positioned(
+                    bottom: 0,
+                    right: 0,
+                    child: GestureDetector(
+                      onTap: _showAvatarOptionsSheet,
+                      child: Container(
+                        width: 28,
+                        height: 28,
+                        decoration: BoxDecoration(
+                          color: Colors.black,
+                          shape: BoxShape.circle,
+                          border: Border.all(color: Colors.white, width: 2),
+                        ),
+                        child: const Icon(
+                          Icons.add,
+                          color: Colors.white,
+                          size: 16,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
               ),
             ),
 
             const SizedBox(height: 12),
 
-            /// 🔹 EMAIL / NOM
+            /// 🔹 NOM
+            Center(
+              child: GestureDetector(
+                onTap: _editDisplayName,
+                child: Text(
+                  () {
+                    final display =
+                        (userData['display_name'] as String?)?.trim();
+                    final username = (userData['username'] as String?)?.trim();
+                    if (display != null && display.isNotEmpty) {
+                      return display;
+                    }
+                    if (username != null && username.isNotEmpty) {
+                      return "@$username";
+                    }
+                    return "Ajouter votre nom";
+                  }(),
+                  style: TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.bold,
+                    color:
+                        (((userData['display_name'] as String?)?.trim() ?? '')
+                                    .isNotEmpty ||
+                                ((userData['username'] as String?)?.trim() ??
+                                        '')
+                                    .isNotEmpty)
+                            ? Colors.black
+                            : Colors.black54,
+                  ),
+                ),
+              ),
+            ),
+
+            const SizedBox(height: 6),
+
+            /// 🔹 EMAIL (petit gris)
             Center(
               child: Text(
-                userData['display_name'] ??
-                    userData['email'] ??
-                    "Utilisateur",
+                userData['email'] ?? "",
                 style: const TextStyle(
-                  fontSize: 20,
-                  fontWeight: FontWeight.bold,
+                  fontSize: 12,
+                  color: Colors.black54,
+                ),
+              ),
+            ),
+
+            const SizedBox(height: 6),
+
+            /// 🔹 BIO
+            Center(
+              child: GestureDetector(
+                onTap: _editBio,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 24),
+                  child: Text(
+                    (userData['bio'] != null &&
+                            (userData['bio'] as String).trim().isNotEmpty)
+                        ? userData['bio']
+                        : "Ajouter une bio",
+                    textAlign: TextAlign.center,
+                    maxLines: 3,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: (userData['bio'] != null &&
+                              (userData['bio'] as String)
+                                  .trim()
+                                  .isNotEmpty)
+                          ? Colors.black87
+                          : Colors.black54,
+                    ),
+                  ),
                 ),
               ),
             ),
@@ -1389,6 +1711,7 @@ class LocalDraftPreviewPage extends StatefulWidget {
 class _LocalDraftPreviewPageState extends State<LocalDraftPreviewPage> {
   VideoPlayerController? _controller;
   bool _publishing = false;
+  bool _deleting = false;
 
   @override
   void initState() {
@@ -1427,6 +1750,36 @@ class _LocalDraftPreviewPageState extends State<LocalDraftPreviewPage> {
     }
   }
 
+  Future<void> _deleteDraft() async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text("Supprimer ?"),
+        content: const Text("Supprimer ce brouillon ?"),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text("Annuler"),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text("Supprimer"),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm != true) return;
+
+    setState(() => _deleting = true);
+    try {
+      DraftLocalStore().deleteWithFiles(widget.draft);
+      if (mounted) Navigator.pop(context, true);
+    } finally {
+      if (mounted) setState(() => _deleting = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final canPublish = widget.draft.state == DraftState.localOnly ||
@@ -1441,6 +1794,19 @@ class _LocalDraftPreviewPageState extends State<LocalDraftPreviewPage> {
         backgroundColor: Colors.black,
         iconTheme: const IconThemeData(color: Colors.white),
         actions: [
+          IconButton(
+            icon: _deleting
+                ? const SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(
+                      color: Colors.white,
+                      strokeWidth: 2,
+                    ),
+                  )
+                : const Icon(Icons.delete, color: Colors.white),
+            onPressed: _deleting ? null : _deleteDraft,
+          ),
           TextButton(
             onPressed: (!canPublish || _publishing || isUploading)
                 ? null
@@ -1459,12 +1825,50 @@ class _LocalDraftPreviewPageState extends State<LocalDraftPreviewPage> {
       ),
       body: Center(
         child: widget.draft.isVideo
-            ? (_controller != null && _controller!.value.isInitialized)
-                ? AspectRatio(
-                    aspectRatio: _controller!.value.aspectRatio,
-                    child: VideoPlayer(_controller!),
-                  )
-                : const CircularProgressIndicator(color: Colors.white)
+            ? Stack(
+                alignment: Alignment.center,
+                children: [
+                  if (_controller == null ||
+                      !_controller!.value.isInitialized)
+                    (widget.draft.thumbnailLocalPath != null
+                            && File(widget.draft.thumbnailLocalPath!).existsSync())
+                        ? Image.file(
+                            File(widget.draft.thumbnailLocalPath!),
+                            fit: BoxFit.cover,
+                          )
+                        : const CircularProgressIndicator(color: Colors.white)
+                  else
+                    GestureDetector(
+                      onTap: () {
+                        if (_controller!.value.isPlaying) {
+                          _controller!.pause();
+                        } else {
+                          _controller!.play();
+                        }
+                        setState(() {});
+                      },
+                      child: AspectRatio(
+                        aspectRatio: _controller!.value.aspectRatio,
+                        child: VideoPlayer(_controller!),
+                      ),
+                    ),
+                  if (_controller != null && _controller!.value.isInitialized)
+                    Positioned(
+                      bottom: 20,
+                      left: 16,
+                      right: 16,
+                      child: VideoProgressIndicator(
+                        _controller!,
+                        allowScrubbing: true,
+                        colors: const VideoProgressColors(
+                          playedColor: Colors.white,
+                          bufferedColor: Colors.white38,
+                          backgroundColor: Colors.white24,
+                        ),
+                      ),
+                    ),
+                ],
+              )
             : isLocalMediaPath(widget.draft.mediaLocalPath)
                 ? Image.file(
                     File(widget.draft.mediaLocalPath),
