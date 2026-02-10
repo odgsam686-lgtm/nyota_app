@@ -13,11 +13,13 @@ Timer? _imageViewTimer;
 class MediaViewerPage extends StatefulWidget {
   final List<PostModel> posts;
   final int initialIndex;
+  final bool allowDelete;
 
   const MediaViewerPage({
     super.key,
     required this.posts,
     required this.initialIndex,
+    this.allowDelete = true,
   });
 
   @override
@@ -28,6 +30,7 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
   late PageController _pageController;
   VideoPlayerController? _videoController;
   int currentIndex = 0;
+  bool _deleting = false;
 
   @override
   void initState() {
@@ -54,6 +57,60 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
     _videoController?.dispose();
     _pageController.dispose();
     super.dispose();
+  }
+
+  Future<void> _confirmDelete(PostModel post) async {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid == null || post.sellerId != uid) return;
+
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text("Supprimer ?"),
+        content: const Text("Supprimer cette publication ?"),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text("Annuler"),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text("Supprimer"),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm != true) return;
+
+    setState(() => _deleting = true);
+    try {
+      await Supabase.instance.client
+          .from('posts')
+          .delete()
+          .eq('id', post.id);
+
+      if (!mounted) return;
+      widget.posts.removeAt(currentIndex);
+      if (widget.posts.isEmpty) {
+        Navigator.pop(context, true);
+        return;
+      }
+      if (currentIndex >= widget.posts.length) {
+        currentIndex = widget.posts.length - 1;
+      }
+      _pageController.jumpToPage(currentIndex);
+      _loadVideoIfNeeded(currentIndex);
+      setState(() {});
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Erreur suppression: $e")),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _deleting = false);
+    }
   }
 
   Future<void> toggleLike(PostModel post) async {
@@ -177,7 +234,7 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
           return Stack(
             alignment: Alignment.center,
             children: [
-              post.isVideo ? _buildVideo() : _buildImage(post),
+              post.isVideo ? _buildVideo(post) : _buildImage(post),
               Positioned(
                 top: 90,
                 right: 16,
@@ -221,6 +278,26 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
                 ),
               ),
 
+              if (widget.allowDelete &&
+                  post.sellerId == FirebaseAuth.instance.currentUser?.uid)
+                Positioned(
+                  top: 40,
+                  right: 16,
+                  child: IconButton(
+                    icon: _deleting
+                        ? const SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(
+                              color: Colors.white,
+                              strokeWidth: 2,
+                            ),
+                          )
+                        : const Icon(Icons.delete, color: Colors.white),
+                    onPressed: _deleting ? null : () => _confirmDelete(post),
+                  ),
+                ),
+
               // ▶️ BARRE DE PROGRESSION
               if (post.isVideo && _videoController != null)
                 Positioned(
@@ -247,9 +324,22 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
   // =======================
   // 🎥 VIDEO WIDGET
   // =======================
-  Widget _buildVideo() {
+  Widget _buildVideo(PostModel post) {
     if (_videoController == null || !_videoController!.value.isInitialized) {
-      return const CircularProgressIndicator(color: Colors.white);
+      final thumb = post.thumbnailUrl;
+      final thumbUrl = (thumb != null && thumb.isNotEmpty)
+          ? (thumb.startsWith('http')
+              ? thumb
+              : storagePublicUrl('posts', thumb))
+          : null;
+      return thumbUrl != null
+          ? Image.network(
+              thumbUrl,
+              fit: BoxFit.cover,
+              errorBuilder: (_, __, ___) =>
+                  const CircularProgressIndicator(color: Colors.white),
+            )
+          : const CircularProgressIndicator(color: Colors.white);
     }
 
     return GestureDetector(

@@ -254,6 +254,15 @@ class _PublicProfilePageState extends State<PublicProfilePage> {
     );
   }
 
+  String _formatDuration(dynamic seconds) {
+    final int? s =
+        seconds is int ? seconds : int.tryParse(seconds?.toString() ?? '');
+    if (s == null || s < 0) return "—:—";
+    final m = s ~/ 60;
+    final r = s % 60;
+    return "${m.toString().padLeft(2, '0')}:${r.toString().padLeft(2, '0')}";
+  }
+
   @override
   Widget build(BuildContext context) {
     if (loading) {
@@ -264,15 +273,19 @@ class _PublicProfilePageState extends State<PublicProfilePage> {
     }
 
     final avatar = sellerData!['avatar_url'];
-    final username = sellerData!['username'] ?? "Utilisateur";
-    final bio = sellerData!['bio'] ?? "";
+    final displayName = (sellerData!['display_name'] as String?)?.trim();
+    final username = (sellerData!['username'] as String?)?.trim();
+    final bio = (sellerData!['bio'] as String?)?.trim() ?? "";
+    final hasUsername = username != null && username.isNotEmpty;
+    final nameText = (displayName != null && displayName.isNotEmpty)
+        ? displayName
+        : (hasUsername ? "@$username" : "Utilisateur");
 
     return Scaffold(
       backgroundColor: Colors.white,
       appBar: AppBar(
         backgroundColor: Colors.white,
         iconTheme: const IconThemeData(color: Colors.black),
-        title: const Text("Profil", style: TextStyle(color: Colors.black)),
       ),
       body: Column(
         children: [
@@ -288,15 +301,23 @@ class _PublicProfilePageState extends State<PublicProfilePage> {
 
           const SizedBox(height: 12),
 
-          /// Username
+          /// Nom
           Text(
-            "@$username",
+            nameText,
             style: const TextStyle(
               color: Colors.black,
-              fontSize: 18,
+              fontSize: 20,
               fontWeight: FontWeight.bold,
             ),
           ),
+
+          if (hasUsername) ...[
+            const SizedBox(height: 4),
+            Text(
+              "@$username",
+              style: const TextStyle(color: Colors.black54, fontSize: 12),
+            ),
+          ],
 
           if (bio.isNotEmpty) ...[
             const SizedBox(height: 6),
@@ -305,7 +326,9 @@ class _PublicProfilePageState extends State<PublicProfilePage> {
               child: Text(
                 bio,
                 textAlign: TextAlign.center,
-                style: const TextStyle(color: Colors.black),
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(color: Colors.black87),
               ),
             ),
           ],
@@ -318,93 +341,88 @@ class _PublicProfilePageState extends State<PublicProfilePage> {
               style: const TextStyle(color: Colors.black),
             ),
             const SizedBox(height: 14),
-            SizedBox(
-              width: 220,
-              child: ElevatedButton(
-                onPressed: () async {
-                  if (!isFollowing) {
-                    // 👉 S’ABONNER DIRECTEMENT
-                    await toggleFollow();
-                  } else {
-                    // 👉 CONFIRMATION AVANT DÉSABONNEMENT
-                    final confirm = await showDialog<bool>(
-                      context: context,
-                      builder: (ctx) => AlertDialog(
-                        title: const Text("Se désabonner"),
-                        content: const Text(
-                          "Voulez-vous vraiment vous désabonner de ce vendeur ?",
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 24),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: SizedBox(
+                      height: 44,
+                      child: ElevatedButton(
+                        onPressed: () async {
+                          if (!isFollowing) {
+                            await toggleFollow();
+                          } else {
+                            final confirm = await showDialog<bool>(
+                              context: context,
+                              builder: (ctx) => AlertDialog(
+                                title: const Text("Se désabonner"),
+                                content: const Text(
+                                  "Voulez-vous vraiment vous désabonner de ce vendeur ?",
+                                ),
+                                actions: [
+                                  TextButton(
+                                    onPressed: () => Navigator.pop(ctx, false),
+                                    child: const Text("Annuler"),
+                                  ),
+                                  ElevatedButton(
+                                    style: ElevatedButton.styleFrom(
+                                      backgroundColor: Colors.red,
+                                    ),
+                                    onPressed: () => Navigator.pop(ctx, true),
+                                    child: const Text(
+                                      "Se désabonner",
+                                      style: TextStyle(color: Colors.black),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            );
+                            if (confirm == true) {
+                              await toggleFollow();
+                            }
+                          }
+                        },
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor:
+                              isFollowing ? Colors.white : Colors.black,
+                          foregroundColor:
+                              isFollowing ? Colors.black : Colors.white,
+                          side: isFollowing
+                              ? const BorderSide(color: Colors.black12)
+                              : null,
                         ),
-                        actions: [
-                          TextButton(
-                            onPressed: () => Navigator.pop(ctx, false),
-                            child: const Text("Annuler"),
-                          ),
-                          ElevatedButton(
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: Colors.red,
-                            ),
-                            onPressed: () => Navigator.pop(ctx, true),
-                            child: const Text(
-                              "Se désabonner",
-                              style: TextStyle(color: Colors.black),
-                            ),
-                          ),
-                        ],
-                      ),
-                    );
-
-                    if (confirm == true) {
-                      await toggleFollow();
-                    }
-                  }
-                },
-                style: ElevatedButton.styleFrom(
-                  backgroundColor:
-                      isFollowing ? Colors.white : Colors.red, // 🤍 ou 🔴
-                  foregroundColor: Colors.black, // 🖤 texte noir
-                  padding: const EdgeInsets.symmetric(vertical: 14),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(10),
-                    side: isFollowing
-                        ? const BorderSide(color: Colors.black12)
-                        : BorderSide.none,
-                  ),
-                  elevation: isFollowing ? 0 : 2,
-                ),
-                child: Text(
-                  isFollowing ? "Se désabonner" : "Suivre",
-                  style: const TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ),
-            ),
-            const SizedBox(width: 12),
-
-            // 💬 BOUTON CHAT (NOUVEAU)
-            SizedBox(
-              width: 160,
-              child: OutlinedButton.icon(
-                icon: const Icon(Icons.chat),
-                label: const Text("Message"),
-                onPressed: () async {
-                  final conversationId =
-                      await getOrCreateConversation(widget.sellerId);
-
-                  if (!mounted) return;
-
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) => ChatScreen(
-                        conversationId: conversationId,
-                        receiverId: widget.sellerId,
-                        currentUserId: FirebaseAuth.instance.currentUser!.uid,
+                        child: Text(isFollowing ? "Abonné" : "Suivre"),
                       ),
                     ),
-                  );
-                },
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: SizedBox(
+                      height: 44,
+                      child: OutlinedButton.icon(
+                        icon: const Icon(Icons.chat),
+                        label: const Text("Message"),
+                        onPressed: () async {
+                          final convoId =
+                              await getOrCreateConversation(widget.sellerId);
+                          if (!mounted) return;
+                          Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                              builder: (_) => ChatScreen(
+                                conversationId: convoId,
+                                receiverId: widget.sellerId,
+                                currentUserId:
+                                    FirebaseAuth.instance.currentUser!.uid,
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                  ),
+                ],
               ),
             ),
           ],
@@ -504,13 +522,29 @@ class _PublicProfilePageState extends State<PublicProfilePage> {
                     itemCount: posts.length,
                     itemBuilder: (context, index) {
                       final post = posts[index];
-                      final postModel = PostModel.fromMap(post);
-
-                      // URL SAFE (image uniquement)
-                      final String imageUrl =
-                          postModel.mediaUrl.startsWith('http')
-                              ? postModel.mediaUrl
-                              : storagePublicUrl('posts', postModel.mediaUrl);
+                      final normalized = Map<String, dynamic>.from(post);
+                      if (normalized['thumbnail_url'] == null &&
+                          normalized['thumbnail_path'] != null) {
+                        normalized['thumbnail_url'] = normalized['thumbnail_path'];
+                      }
+                      final postModel = PostModel.fromMap(normalized);
+                      final thumbRaw = (normalized['thumbnail_url'] ??
+                              normalized['thumbnail_path'])
+                          ?.toString();
+                      final fallbackRaw = postModel.mediaUrl;
+                      final String? thumbOrMedia =
+                          (thumbRaw != null && thumbRaw.isNotEmpty)
+                              ? thumbRaw
+                              : (fallbackRaw.isNotEmpty ? fallbackRaw : null);
+                      final String? imageUrl = thumbOrMedia == null
+                          ? null
+                          : (thumbOrMedia.startsWith('http')
+                              ? thumbOrMedia
+                              : storagePublicUrl('posts', thumbOrMedia));
+                      final durationSeconds = normalized['duration_seconds'] ??
+                          normalized['durationSeconds'] ??
+                          normalized['duration'];
+                      final durationLabel = _formatDuration(durationSeconds);
 
                       return GestureDetector(
                         onTap: () {
@@ -519,9 +553,17 @@ class _PublicProfilePageState extends State<PublicProfilePage> {
                             MaterialPageRoute(
                               builder: (_) => MediaViewerPage(
                                 posts: posts
-                                    .map((e) => PostModel.fromMap(e))
+                                    .map((e) {
+                                      final m = Map<String, dynamic>.from(e);
+                                      if (m['thumbnail_url'] == null &&
+                                          m['thumbnail_path'] != null) {
+                                        m['thumbnail_url'] = m['thumbnail_path'];
+                                      }
+                                      return PostModel.fromMap(m);
+                                    })
                                     .toList(),
                                 initialIndex: index,
+                                allowDelete: false,
                               ),
                             ),
                           );
@@ -531,26 +573,47 @@ class _PublicProfilePageState extends State<PublicProfilePage> {
                           child: Stack(
                             children: [
                               Positioned.fill(
-                                child: postModel.isVideo
-                                    // 🎥 VIDÉO = PLACEHOLDER (COMME PUBLICATION)
+                                child: imageUrl == null
                                     ? Container(
-                                        color: Colors.black,
+                                        color: Colors.black12,
                                         child: const Center(
                                           child: Icon(
                                             Icons.play_circle_fill,
-                                            color: Colors.white,
-                                            size: 50,
+                                            color: Colors.white70,
+                                            size: 40,
                                           ),
                                         ),
                                       )
-                                    // 🖼 IMAGE = CHARGEMENT NORMAL
                                     : Image.network(
                                         imageUrl,
                                         fit: BoxFit.cover,
+                                        loadingBuilder:
+                                            (context, child, progress) {
+                                          if (progress == null) return child;
+                                          return Container(
+                                            color: Colors.black12,
+                                            child: const Center(
+                                              child: Icon(
+                                                Icons.play_circle_fill,
+                                                color: Colors.white70,
+                                                size: 40,
+                                              ),
+                                            ),
+                                          );
+                                        },
+                                        errorBuilder: (_, __, ___) => Container(
+                                          color: Colors.black12,
+                                          child: const Center(
+                                            child: Icon(
+                                              Icons.play_circle_fill,
+                                              color: Colors.white70,
+                                              size: 40,
+                                            ),
+                                          ),
+                                        ),
                                       ),
                               ),
 
-                              // Icône vidéo
                               if (postModel.isVideo)
                                 const Positioned(
                                   bottom: 6,
@@ -559,6 +622,29 @@ class _PublicProfilePageState extends State<PublicProfilePage> {
                                     Icons.videocam,
                                     color: Colors.white,
                                     size: 20,
+                                  ),
+                                ),
+
+                              if (postModel.isVideo)
+                                Positioned(
+                                  bottom: 6,
+                                  left: 6,
+                                  child: Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 6,
+                                      vertical: 2,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: Colors.black54,
+                                      borderRadius: BorderRadius.circular(4),
+                                    ),
+                                    child: Text(
+                                      durationLabel,
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 11,
+                                      ),
+                                    ),
                                   ),
                                 ),
                             ],
