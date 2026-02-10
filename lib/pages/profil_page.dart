@@ -430,6 +430,7 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
   // ===========================
   File? _pendingAvatar;
   bool _uploadingAvatar = false;
+  String? _avatarUrlUI;
 
   Future<void> _pickAndUploadPhoto(ImageSource source) async {
     final XFile? file = await picker.pickImage(
@@ -445,42 +446,91 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
     final avatarFile = File(file.path);
 
     try {
-      // ✅ UPLOAD RÉEL DU FICHIER CAMÉRA
-      await supabase.storage.from('avatars').upload(
-            fileName,
-            avatarFile,
-            fileOptions: const FileOptions(upsert: true),
+      // 1) Upload storage
+      try {
+        await supabase.storage.from('avatars').upload(
+              fileName,
+              avatarFile,
+              fileOptions: const FileOptions(upsert: true),
+            );
+      } catch (e) {
+        debugPrint("ERREUR upload storage avatar: $e");
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text("Erreur upload storage: $e")),
           );
+        }
+        return;
+      }
 
       final avatarUrl = storagePublicUrl('avatars', fileName);
 
-      // ✅ UPDATE USER
-      await supabase.from('users').update({
-        'photo_url': avatarUrl,
-      }).eq('firebase_uid', userId!);
+      // 2) Update users (ne pas bloquer UI si public_profiles échoue)
+      try {
+        await supabase.from('users').update({
+          'photo_url': avatarUrl,
+        }).eq('firebase_uid', userId!);
+      } catch (e) {
+        debugPrint("ERREUR update users photo_url: $e");
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text("Erreur update users: $e")),
+          );
+        }
+      }
 
-      // ✅ SYNC public_profiles
-      await supabase.from('public_profiles').upsert({
-        'user_id': userId!,
-        'avatar_url': avatarUrl,
-        'updated_at': DateTime.now().toIso8601String(),
-      });
+      // ✅ UI refresh immédiat (cache-bust)
+      if (mounted) {
+        setState(() {
+          userData ??= {};
+          userData!['photo_url'] = avatarUrl;
+          _avatarUrlUI =
+              "$avatarUrl?v=${DateTime.now().millisecondsSinceEpoch}";
+        });
+      }
 
-      if (!mounted) return;
+      // 3) Sync public_profiles (séparé)
+      try {
+        final profile = await supabase
+            .from('public_profiles')
+            .select('username, display_name, bio')
+            .eq('user_id', userId!)
+            .maybeSingle();
+        final existingUsername = profile?['username']?.toString().trim();
+        final usernameToSave = (existingUsername == null ||
+                existingUsername.isEmpty)
+            ? await _generateUniqueUsername(displayName ?? userId!, userId!)
+            : existingUsername;
 
-      setState(() {
-        userData ??= {};
-        userData!['photo_url'] = avatarUrl;
-      });
+        await supabase.from('public_profiles').upsert({
+          'user_id': userId!,
+          'username': usernameToSave,
+          'avatar_url': avatarUrl,
+          'display_name': displayName ?? profile?['display_name'],
+          'bio': bio ?? profile?['bio'],
+          'updated_at': DateTime.now().toIso8601String(),
+        });
+      } catch (e) {
+        debugPrint("ERREUR upsert public_profiles avatar: $e");
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text("Erreur public_profiles: $e")),
+          );
+        }
+      }
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("✅ Photo mise à jour")),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("✅ Photo mise à jour")),
+        );
+      }
     } catch (e) {
-      debugPrint("❌ ERREUR upload avatar: $e");
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Erreur upload photo")),
-      );
+      debugPrint("ERREUR upload avatar (global): $e");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Erreur upload photo: $e")),
+        );
+      }
     }
   }
 
@@ -576,29 +626,69 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
     if (userId == null) return;
 
     try {
-      await supabase.from('users').update({
-        'photo_url': null,
-      }).eq('firebase_uid', userId!);
+      // 1) Update users
+      try {
+        await supabase.from('users').update({
+          'photo_url': null,
+        }).eq('firebase_uid', userId!);
+      } catch (e) {
+        debugPrint("ERREUR update users delete avatar: $e");
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text("Erreur update users: $e")),
+          );
+        }
+      }
 
-      await supabase.from('public_profiles').upsert({
-        'user_id': userId!,
-        'avatar_url': null,
-        'updated_at': DateTime.now().toIso8601String(),
-      });
+      if (mounted) {
+        setState(() {
+          userData?['photo_url'] = null;
+          _avatarUrlUI = null;
+        });
+      }
 
-      if (!mounted) return;
+      // 2) Sync public_profiles
+      try {
+        final profile = await supabase
+            .from('public_profiles')
+            .select('username, display_name, bio')
+            .eq('user_id', userId!)
+            .maybeSingle();
+        final existingUsername = profile?['username']?.toString().trim();
+        final usernameToSave = (existingUsername == null ||
+                existingUsername.isEmpty)
+            ? await _generateUniqueUsername(displayName ?? userId!, userId!)
+            : existingUsername;
 
-      setState(() {
-        userData?['photo_url'] = null;
-      });
+        await supabase.from('public_profiles').upsert({
+          'user_id': userId!,
+          'username': usernameToSave,
+          'avatar_url': null,
+          'display_name': displayName ?? profile?['display_name'],
+          'bio': bio ?? profile?['bio'],
+          'updated_at': DateTime.now().toIso8601String(),
+        });
+      } catch (e) {
+        debugPrint("ERREUR upsert public_profiles delete avatar: $e");
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text("Erreur public_profiles: $e")),
+          );
+        }
+      }
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("✅ Photo de profil supprimée")),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("✅ Photo de profil supprimée")),
+        );
+      }
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("❌ Erreur suppression avatar")),
-      );
+      debugPrint("ERREUR suppression avatar (global): $e");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Erreur suppression avatar: $e")),
+        );
+      }
     }
   }
 
@@ -1191,12 +1281,29 @@ Widget build(BuildContext context) {
             Center(
               child: Stack(
                 children: [
-                  CircleAvatar(
-                    radius: 55,
-                    backgroundImage: userData['photo_url'] != null
-                        ? NetworkImage(userData['photo_url'])
-                        : const AssetImage("assets/images/avatar.png")
-                            as ImageProvider,
+                  GestureDetector(
+                    onTap: () {
+                      final photoUrl =
+                          _avatarUrlUI ?? userData['photo_url'];
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => AvatarFullScreenPage(
+                            photoUrl: photoUrl,
+                            onDelete: _deleteAvatar,
+                          ),
+                        ),
+                      );
+                    },
+                    child: CircleAvatar(
+                      radius: 55,
+                      backgroundImage: (userData['photo_url'] != null)
+                          ? NetworkImage(
+                              _avatarUrlUI ?? userData['photo_url'],
+                            )
+                          : const AssetImage("assets/images/avatar.png")
+                              as ImageProvider,
+                    ),
                   ),
                   Positioned(
                     bottom: 0,
@@ -1878,6 +1985,66 @@ class _LocalDraftPreviewPageState extends State<LocalDraftPreviewPage> {
                     resolveMediaUrl(widget.draft.mediaLocalPath),
                     fit: BoxFit.contain,
                   ),
+      ),
+    );
+  }
+}
+
+class AvatarFullScreenPage extends StatelessWidget {
+  final String? photoUrl;
+  final Future<void> Function() onDelete;
+
+  const AvatarFullScreenPage({
+    super.key,
+    required this.photoUrl,
+    required this.onDelete,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final hasAvatar = photoUrl != null && photoUrl!.trim().isNotEmpty;
+
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.black,
+        iconTheme: const IconThemeData(color: Colors.white),
+        actions: [
+          if (hasAvatar)
+            IconButton(
+              icon: const Icon(Icons.delete, color: Colors.white),
+              onPressed: () async {
+                final confirm = await showDialog<bool>(
+                  context: context,
+                  builder: (_) => AlertDialog(
+                    title: const Text("Supprimer la photo ?"),
+                    actions: [
+                      TextButton(
+                        onPressed: () => Navigator.pop(context, false),
+                        child: const Text("Annuler"),
+                      ),
+                      ElevatedButton(
+                        onPressed: () => Navigator.pop(context, true),
+                        child: const Text("Supprimer"),
+                      ),
+                    ],
+                  ),
+                );
+
+                if (confirm == true) {
+                  await onDelete();
+                  if (context.mounted) Navigator.pop(context);
+                }
+              },
+            ),
+        ],
+      ),
+      body: Center(
+        child: InteractiveViewer(
+          child: hasAvatar
+              ? Image.network(photoUrl!, fit: BoxFit.contain)
+              : Image.asset("assets/images/avatar.png", fit: BoxFit.contain),
+        ),
       ),
     );
   }
