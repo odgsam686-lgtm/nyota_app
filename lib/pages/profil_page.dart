@@ -1332,34 +1332,47 @@ Widget build(BuildContext context) {
 
             const SizedBox(height: 12),
 
-            /// 🔹 NOM
+            /// 🔹 NOM (capsule)
             Center(
               child: GestureDetector(
                 onTap: _editDisplayName,
-                child: Text(
-                  () {
-                    final display =
-                        (userData['display_name'] as String?)?.trim();
-                    final username = (userData['username'] as String?)?.trim();
-                    if (display != null && display.isNotEmpty) {
-                      return display;
-                    }
-                    if (username != null && username.isNotEmpty) {
-                      return "@$username";
-                    }
-                    return "Ajouter votre nom";
-                  }(),
-                  style: TextStyle(
-                    fontSize: 20,
-                    fontWeight: FontWeight.bold,
-                    color:
-                        (((userData['display_name'] as String?)?.trim() ?? '')
-                                    .isNotEmpty ||
-                                ((userData['username'] as String?)?.trim() ??
-                                        '')
-                                    .isNotEmpty)
-                            ? Colors.black
-                            : Colors.black54,
+                child: Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withOpacity(0.05),
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        () {
+                          final display =
+                              (userData['display_name'] as String?)?.trim();
+                          if (display != null && display.isNotEmpty) {
+                            return display;
+                          }
+                          return "+ Ajouter un nom";
+                        }(),
+                        style: TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w600,
+                          color: (userData['display_name'] as String?)
+                                      ?.trim()
+                                      .isNotEmpty ==
+                                  true
+                              ? Colors.black
+                              : Colors.black54,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      const Icon(Icons.chevron_right,
+                          size: 18, color: Colors.black54),
+                      const SizedBox(width: 2),
+                      const Icon(Icons.edit,
+                          size: 16, color: Colors.black54),
+                    ],
                   ),
                 ),
               ),
@@ -1380,26 +1393,33 @@ Widget build(BuildContext context) {
 
             const SizedBox(height: 6),
 
-            /// 🔹 BIO
+            /// 🔹 BIO (capsule)
             Center(
               child: GestureDetector(
                 onTap: _editBio,
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 24),
+                child: Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withOpacity(0.05),
+                    borderRadius: BorderRadius.circular(999),
+                  ),
                   child: Text(
-                    (userData['bio'] != null &&
-                            (userData['bio'] as String).trim().isNotEmpty)
-                        ? userData['bio']
-                        : "Ajouter une bio",
+                    () {
+                      final bioText =
+                          (userData['bio'] as String?)?.trim() ?? "";
+                      if (bioText.isNotEmpty) {
+                        return "Mon activité est $bioText";
+                      }
+                      return "+ Ajouter une bio";
+                    }(),
                     textAlign: TextAlign.center,
-                    maxLines: 3,
+                    maxLines: 2,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
                       fontSize: 13,
-                      color: (userData['bio'] != null &&
-                              (userData['bio'] as String)
-                                  .trim()
-                                  .isNotEmpty)
+                      color: (userData['bio'] as String?)?.trim().isNotEmpty ==
+                              true
                           ? Colors.black87
                           : Colors.black54,
                     ),
