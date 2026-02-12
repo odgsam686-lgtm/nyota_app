@@ -1404,25 +1404,43 @@ Widget build(BuildContext context) {
                     color: Colors.black.withOpacity(0.05),
                     borderRadius: BorderRadius.circular(999),
                   ),
-                  child: Text(
-                    () {
-                      final bioText =
-                          (userData['bio'] as String?)?.trim() ?? "";
-                      if (bioText.isNotEmpty) {
-                        return "Mon activité est $bioText";
-                      }
-                      return "+ Ajouter une bio";
-                    }(),
-                    textAlign: TextAlign.center,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 13,
-                      color: (userData['bio'] as String?)?.trim().isNotEmpty ==
-                              true
-                          ? Colors.black87
-                          : Colors.black54,
-                    ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Flexible(
+                        child: Text(
+                          () {
+                            final bioText =
+                                (userData['bio'] as String?)?.trim() ?? "";
+                            if (bioText.isNotEmpty) {
+                              return bioText;
+                            }
+                            return "+ Ajouter une bio ·  Mon activité est…";
+                          }(),
+                          textAlign: TextAlign.center,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 13,
+                            color: (userData['bio'] as String?)
+                                        ?.trim()
+                                        .isNotEmpty ==
+                                    true
+                                ? Colors.black87
+                                : Colors.black54,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      GestureDetector(
+                        onTap: _editBio,
+                        child: const Icon(
+                          Icons.edit,
+                          size: 16,
+                          color: Colors.black54,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ),

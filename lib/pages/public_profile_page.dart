@@ -336,10 +336,6 @@ class _PublicProfilePageState extends State<PublicProfilePage> {
           /// Followers + Follow button (VENDEUR UNIQUEMENT)
           if (isSeller) ...[
             const SizedBox(height: 10),
-            Text(
-              "$followersCount abonnés",
-              style: const TextStyle(color: Colors.black),
-            ),
             const SizedBox(height: 14),
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 24),
