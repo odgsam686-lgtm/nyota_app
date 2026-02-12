@@ -64,17 +64,30 @@ class AddPostPage extends StatefulWidget {
   State<AddPostPage> createState() => _AddPostPageState();
 }
 
-class _AddPostPageState extends State<AddPostPage> {
+class _AddPostPageState extends State<AddPostPage>
+    with WidgetsBindingObserver {
   final ImagePicker _picker = ImagePicker();
 
   File? _selectedFile; // fichier temporaire local (copie fiable)
   bool _isVideo = false;
   bool _loading = false;
+  bool _pickingMedia = false;
   bool _showMediaOptions = false;
   VideoPlayerController? _videoController;
   bool _isPlaying = true;
 
   final TextEditingController _descriptionCtrl = TextEditingController();
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    debugPrint("draft lifecycle: $state");
+  }
 
   // -----------------------------
   // Helpers
@@ -117,71 +130,112 @@ class _AddPostPageState extends State<AddPostPage> {
   // Pickers (gallery + camera)
   // -----------------------------
   Future<void> _pickImageFromGallery() async {
+    if (_pickingMedia) return;
+    if (mounted) {
+      setState(() => _pickingMedia = true);
+    }
+
     try {
       final XFile? picked =
           await _picker.pickImage(source: ImageSource.gallery);
+      if (!mounted) return;
       if (picked == null) return;
 
       final bytes = await picked.readAsBytes();
+      if (!mounted) return;
       final ext = picked.path.split('.').last;
       final tmp = await _writeBytesToTempFile(bytes, ext);
 
+      if (!mounted) return;
       setState(() {
         _selectedFile = tmp;
         _isVideo = false;
       });
     } catch (e) {
       debugPrint("pick image error: $e");
-      ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text("Erreur sélection image")));
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text("Erreur sélection image")));
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _pickingMedia = false);
+      }
     }
   }
 
   Future<void> _pickVideoFromGallery() async {
+    if (_pickingMedia) return;
+    if (mounted) {
+      setState(() => _pickingMedia = true);
+    }
+
     try {
       final XFile? picked =
           await _picker.pickVideo(source: ImageSource.gallery);
+      if (!mounted) return;
       if (picked == null) return;
 
       final bytes = await picked.readAsBytes();
+      if (!mounted) return;
       final ext = picked.path.split('.').last;
       final tmp = await _writeBytesToTempFile(bytes, ext);
 
+      if (_videoController != null) {
+        await _videoController!.pause();
+        await _videoController!.dispose();
+        _videoController = null;
+      }
+
+      final controller = VideoPlayerController.file(tmp);
+      await controller.initialize();
+      controller.play();
+
+      if (!mounted) return;
       setState(() {
         _selectedFile = tmp;
         _isVideo = true;
+        _videoController = controller;
+        _isPlaying = true;
       });
-      _videoController?.dispose();
-      _videoController = VideoPlayerController.file(tmp)
-        ..initialize().then((_) {
-          setState(() {
-            _videoController!.play();
-            _isPlaying = true;
-          });
-        });
     } catch (e) {
       debugPrint("pick video error: $e");
-      ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text("Erreur sélection vidéo")));
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text("Erreur sélection vidéo")));
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _pickingMedia = false);
+      }
     }
   }
 
   Future<void> _captureImageWithCamera() async {
+    if (_pickingMedia) return;
+    if (mounted) {
+      setState(() => _pickingMedia = true);
+    }
+
     try {
       // ✅ Sécurité cycle de vie
       if (!mounted) return;
 
+      debugPrint("draft camera open");
       final XFile? picked = await _picker.pickImage(
         source: ImageSource.camera,
         imageQuality: 85,
         preferredCameraDevice: CameraDevice.rear,
+        requestFullMetadata: false,
       );
 
       // ✅ L'utilisateur a annulé
+      debugPrint("draft camera returned");
       if (picked == null || picked.path.isEmpty) return;
 
       // ✅ Lecture sécurisée
       final bytes = await picked.readAsBytes();
+      if (!mounted) return;
       if (bytes.isEmpty) return;
 
       final ext = picked.path.split('.').last;
@@ -204,6 +258,7 @@ class _AddPostPageState extends State<AddPostPage> {
         _isVideo = false;
         _isPlaying = false;
       });
+      debugPrint("draft ui updated");
     } catch (e) {
       debugPrint("camera image error: $e");
 
@@ -212,39 +267,67 @@ class _AddPostPageState extends State<AddPostPage> {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text("Erreur caméra (image)")),
       );
+    } finally {
+      if (mounted) {
+        setState(() => _pickingMedia = false);
+      }
     }
   }
 
   Future<void> _captureVideoWithCamera() async {
+    if (_pickingMedia) return;
+    if (mounted) {
+      setState(() => _pickingMedia = true);
+    }
+
     try {
+      if (!mounted) return;
+      debugPrint("draft camera open");
       final XFile? picked = await _picker.pickVideo(
         source: ImageSource.camera,
         maxDuration: const Duration(minutes: 2),
       );
+      debugPrint("draft camera returned");
+      if (!mounted) return;
       if (picked == null) return;
 
       final bytes = await picked.readAsBytes();
+      if (!mounted) return;
       final ext = picked.path.split('.').last;
 
       // 🔥 Copier dans un vrai fichier
       final tmp = await _writeBytesToTempFile(bytes, ext);
 
       // 🔥 Initialiser le lecteur vidéo
-      _videoController?.dispose();
-      _videoController = VideoPlayerController.file(tmp);
-      await _videoController!.initialize();
-      _videoController!.setLooping(true);
+      if (_videoController != null) {
+        await _videoController!.pause();
+        await _videoController!.dispose();
+        _videoController = null;
+      }
 
+      final controller = VideoPlayerController.file(tmp);
+      await controller.initialize();
+      controller.setLooping(true);
+
+      if (!mounted) return;
       setState(() {
         _selectedFile = tmp;
         _isVideo = true;
         _isPlaying = false;
+        _videoController = controller;
       });
+      debugPrint("draft ui updated");
     } catch (e) {
       debugPrint("camera video error: $e");
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Erreur caméra (vidéo)")),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Erreur caméra (vidéo)")),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _pickingMedia = false);
+      }
     }
   }
 
@@ -255,6 +338,7 @@ Future<void> _saveDraft() async {
   if (_selectedFile == null) return;
 
   setState(() => _loading = true);
+  debugPrint("draft upload start");
 
   try {
     final user = FirebaseAuth.instance.currentUser;
@@ -284,6 +368,7 @@ Future<void> _saveDraft() async {
     );
 
     DraftLocalStore().upsert(draft);
+    debugPrint("draft upload done");
 
     if (mounted) Navigator.pop(context, true);
   } catch (e) {
@@ -402,9 +487,11 @@ Future<void> _saveDraft() async {
               ListTile(
                 leading: const Icon(Icons.videocam),
                 title: const Text("Caméra (Vidéo)"),
-                onTap: () {
+                onTap: () async {
                   Navigator.pop(context);
-                  _captureVideoWithCamera();
+                  await Future.delayed(const Duration(milliseconds: 400));
+                  if (!mounted) return;
+                  await _captureVideoWithCamera();
                 },
               ),
             ],
@@ -596,6 +683,7 @@ Future<void> _saveDraft() async {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _videoController?.dispose();
     _descriptionCtrl.dispose();
     super.dispose();

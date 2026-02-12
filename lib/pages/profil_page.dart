@@ -433,19 +433,32 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
   String? _avatarUrlUI;
 
   Future<void> _pickAndUploadPhoto(ImageSource source) async {
+    if (_uploadingAvatar) return;
+    if (userId == null) return;
+
+    if (mounted) {
+      setState(() => _uploadingAvatar = true);
+    }
+
+    debugPrint("camera open");
     final XFile? file = await picker.pickImage(
       source: source,
       imageQuality: 70,
       maxWidth: 1024,
+      preferredCameraDevice: CameraDevice.rear,
+      requestFullMetadata: false,
     );
 
-    if (file == null || userId == null) return;
+    debugPrint("camera returned");
+    if (!mounted) return;
+    if (file == null) return;
 
     final ext = file.path.split('.').last;
     final fileName = "${userId!}_${DateTime.now().millisecondsSinceEpoch}.$ext";
     final avatarFile = File(file.path);
 
     try {
+      debugPrint("upload start");
       // 1) Upload storage
       try {
         await supabase.storage.from('avatars').upload(
@@ -463,6 +476,8 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
         return;
       }
 
+      debugPrint("upload done");
+      if (!mounted) return;
       final avatarUrl = storagePublicUrl('avatars', fileName);
 
       // 2) Update users (ne pas bloquer UI si public_profiles échoue)
@@ -470,6 +485,7 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
         await supabase.from('users').update({
           'photo_url': avatarUrl,
         }).eq('firebase_uid', userId!);
+        debugPrint("db update done");
       } catch (e) {
         debugPrint("ERREUR update users photo_url: $e");
         if (mounted) {
@@ -480,13 +496,17 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
       }
 
       // ✅ UI refresh immédiat (cache-bust)
+      if (!mounted) return;
+      final newUrl =
+          "$avatarUrl?v=${DateTime.now().millisecondsSinceEpoch}";
+
       if (mounted) {
         setState(() {
           userData ??= {};
-          userData!['photo_url'] = avatarUrl;
-          _avatarUrlUI =
-              "$avatarUrl?v=${DateTime.now().millisecondsSinceEpoch}";
+          userData!['photo_url'] = newUrl;
+          _avatarUrlUI = newUrl;
         });
+        debugPrint("ui updated");
       }
 
       // 3) Sync public_profiles (séparé)
@@ -530,6 +550,10 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text("Erreur upload photo: $e")),
         );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _uploadingAvatar = false);
       }
     }
   }
@@ -1258,6 +1282,7 @@ Widget build(BuildContext context) {
 
       return Scaffold(
         appBar: AppBar(
+          toolbarHeight: 44,
           actions: [
             IconButton(
               icon: const Icon(Icons.more_vert),
@@ -1275,7 +1300,7 @@ Widget build(BuildContext context) {
           ],
         ),
         body: ListView(
-          padding: const EdgeInsets.all(16),
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
           children: [
             /// 🔹 AVATAR
             Center(

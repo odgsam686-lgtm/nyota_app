@@ -62,16 +62,18 @@ class _CatalogPageState extends State<CatalogPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Catalogue')),
+      appBar: AppBar(
+        toolbarHeight: 44,
+      ),
       body: Column(
         children: [
           /// 🔹 Catégories
           SizedBox(
-            height: 72,
+            height: 56,
             child: ListView.separated(
               scrollDirection: Axis.horizontal,
               itemCount: categories.length,
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 12),
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
               separatorBuilder: (_, __) => const SizedBox(width: 8),
               itemBuilder: (context, i) {
                 final c = categories[i];
