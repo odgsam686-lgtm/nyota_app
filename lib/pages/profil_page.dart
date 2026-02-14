@@ -1284,19 +1284,7 @@ Widget build(BuildContext context) {
         appBar: AppBar(
           toolbarHeight: 44,
           actions: [
-            IconButton(
-              icon: const Icon(Icons.more_vert),
-              onPressed: () {
-                showModalBottomSheet(
-                  context: context,
-                  shape: const RoundedRectangleBorder(
-                    borderRadius:
-                        BorderRadius.vertical(top: Radius.circular(20)),
-                  ),
-                  builder: (_) => const PrivateProfileMenu(),
-                );
-              },
-            ),
+            const PrivateProfileMenu(),
           ],
         ),
         body: ListView(
