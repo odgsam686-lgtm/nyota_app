@@ -236,6 +236,58 @@ class _ChatScreenState extends State<ChatScreen> {
     _pendingIsVideo = false;
   }
 
+  void _updateLocalMessage(String clientId, Map<String, dynamic> patch) {
+    final idx = _localMessages.indexWhere(
+        (m) => m['client_id']?.toString() == clientId);
+    if (idx == -1) return;
+    setState(() {
+      _localMessages[idx] = {
+        ..._localMessages[idx],
+        ...patch,
+      };
+    });
+  }
+
+  Future<void> _retryUpload(Map<String, dynamic> msg) async {
+    final clientId = msg['client_id']?.toString();
+    final localPath = msg['media_local_path']?.toString();
+    if (clientId == null || localPath == null || localPath.isEmpty) return;
+    final file = File(localPath);
+    if (!file.existsSync()) return;
+    final isVideo = msg['message_type']?.toString() == 'video';
+    _updateLocalMessage(clientId, {'upload_status': 'uploading'});
+    try {
+      final uploaded = await _uploadMediaFile(file, isVideo, clientId);
+      final mediaUrl = uploaded['mediaUrl'];
+      final thumbUrl = uploaded['thumbUrl'];
+
+      await supabase.from('messages').upsert(
+        {
+          'client_id': clientId,
+          'conversation_id': widget.conversationId,
+          'sender_id': currentUserId,
+          'receiver_id': widget.receiverId,
+          'content': msg['content'] ?? '',
+          'message_type': isVideo ? 'video' : 'image',
+          'media_url': mediaUrl,
+          'thumbnail_url': thumbUrl,
+          'is_read': false,
+        },
+        onConflict: 'conversation_id,client_id',
+        ignoreDuplicates: true,
+      );
+
+      _updateLocalMessage(clientId, {
+        'media_url': mediaUrl,
+        'thumbnail_url': thumbUrl,
+        'upload_status': 'done',
+      });
+    } catch (e) {
+      debugPrint("retry upload error: $e");
+      _updateLocalMessage(clientId, {'upload_status': 'failed'});
+    }
+  }
+
   String _fileExtension(String path) {
     final dot = path.lastIndexOf('.');
     if (dot == -1) return 'bin';
@@ -256,13 +308,16 @@ class _ChatScreenState extends State<ChatScreen> {
     return null;
   }
 
-  Future<Map<String, String?>> _uploadPendingMedia(String clientId) async {
-    final file = _pendingMediaFile!;
+  Future<Map<String, String?>> _uploadMediaFile(
+    File file,
+    bool isVideo,
+    String clientId,
+  ) async {
     final ext = _fileExtension(file.path);
     final objectPath =
         "messages/${widget.conversationId}/$clientId.$ext";
     debugPrint("CHAT UPLOAD bucket=$_mediaBucket path=$objectPath");
-    final contentType = _contentTypeFor(ext, _pendingIsVideo);
+    final contentType = _contentTypeFor(ext, isVideo);
     await supabase.storage.from(_mediaBucket).upload(
           objectPath,
           file,
@@ -273,7 +328,7 @@ class _ChatScreenState extends State<ChatScreen> {
         );
     final mediaUrl = supabase.storage.from(_mediaBucket).getPublicUrl(objectPath);
     String? thumbUrl;
-    if (_pendingIsVideo) {
+    if (isVideo) {
       thumbUrl = await VideoThumbnailService.generateAndUpload(
         videoFile: file,
         userId: currentUserId,
@@ -448,6 +503,21 @@ class _ChatScreenState extends State<ChatScreen> {
         .eq('conversation_id', widget.conversationId)
         .neq('sender_id', currentUserId)
         .eq('is_read', false);
+    await _touchConversationRead();
+  }
+
+  Future<void> _touchConversationRead() async {
+    try {
+      debugPrint(
+          "READ UPSERT conversation_id=${widget.conversationId} user_id=$currentUserId");
+      await supabase.from('conversation_reads').upsert({
+        'conversation_id': widget.conversationId,
+        'user_id': currentUserId,
+        'last_read_at': DateTime.now().toIso8601String(),
+      }, onConflict: 'conversation_id,user_id');
+    } catch (e) {
+      debugPrint("conversation_reads upsert error: $e");
+    }
   }
 
   Future<void> _setTyping(bool typing) async {
@@ -492,6 +562,8 @@ class _ChatScreenState extends State<ChatScreen> {
         ? (_pendingIsVideo ? 'video' : 'image')
         : 'text';
     final caption = text;
+    final pendingFile = _pendingMediaFile;
+    final pendingIsVideo = _pendingIsVideo;
     final tempMessage = {
       'id': 'local_${DateTime.now().millisecondsSinceEpoch}',
       'client_id': clientId,
@@ -500,7 +572,8 @@ class _ChatScreenState extends State<ChatScreen> {
       'receiver_id': widget.receiverId,
       'content': caption,
       'message_type': messageType,
-      'media_local_path': hasMedia ? _pendingMediaFile!.path : null,
+      'media_local_path': hasMedia ? pendingFile!.path : null,
+      'upload_status': hasMedia ? 'uploading' : 'sent',
       'created_at': DateTime.now().toIso8601String(),
       'is_read': false,
       'is_local': true, // 👈 IMPORTANT
@@ -508,17 +581,18 @@ class _ChatScreenState extends State<ChatScreen> {
 
     setState(() {
       _localMessages.add(tempMessage);
+      _controller.clear();
+      _pendingText = '';
+      _clearPendingMedia();
     });
-
-    _controller.clear();
-    _pendingText = '';
     _scrollToBottom();
 
     try {
       String? mediaUrl;
       String? thumbUrl;
       if (hasMedia) {
-        final uploaded = await _uploadPendingMedia(clientId);
+        final uploaded =
+            await _uploadMediaFile(pendingFile!, pendingIsVideo, clientId);
         mediaUrl = uploaded['mediaUrl'];
         thumbUrl = uploaded['thumbUrl'];
       }
@@ -547,19 +621,16 @@ class _ChatScreenState extends State<ChatScreen> {
       }).eq('id', widget.conversationId);
       await _clearDraft();
       if (hasMedia) {
-        setState(() {
-          _clearPendingMedia();
+        _updateLocalMessage(clientId, {
+          'media_url': mediaUrl,
+          'thumbnail_url': thumbUrl,
+          'upload_status': 'done',
         });
       }
     } catch (e) {
       debugPrint("sendMessage error: $e");
       if (hasMedia) {
-        _localMessages.removeWhere(
-            (m) => m['client_id']?.toString() == clientId);
-        if (mounted) {
-          _setControllerText(caption);
-          setState(() {});
-        }
+        _updateLocalMessage(clientId, {'upload_status': 'failed'});
       }
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -748,6 +819,8 @@ class _ChatScreenState extends State<ChatScreen> {
                       final localMediaPath =
                           msg['media_local_path']?.toString();
                       final caption = msg['content']?.toString() ?? '';
+                      final uploadStatus =
+                          msg['upload_status']?.toString() ?? '';
                       final bool isRead =
                           msg['is_read'] == true || msg['read_at'] != null;
                       final bool isDelivered =
@@ -791,6 +864,10 @@ class _ChatScreenState extends State<ChatScreen> {
                                     mediaUrl: mediaUrl,
                                     thumbnailUrl: thumbnailUrl,
                                     localPath: localMediaPath,
+                                    uploadStatus: uploadStatus,
+                                    onRetry: uploadStatus == 'failed'
+                                        ? () => _retryUpload(msg)
+                                        : null,
                                     onTap: () {
                                       if (msgType == 'image') {
                                         Navigator.push(
@@ -979,6 +1056,8 @@ class _ChatMediaBubble extends StatelessWidget {
   final String? mediaUrl;
   final String? thumbnailUrl;
   final String? localPath;
+  final String uploadStatus;
+  final VoidCallback? onRetry;
   final VoidCallback onTap;
 
   const _ChatMediaBubble({
@@ -986,6 +1065,8 @@ class _ChatMediaBubble extends StatelessWidget {
     required this.mediaUrl,
     required this.thumbnailUrl,
     required this.localPath,
+    required this.uploadStatus,
+    this.onRetry,
     required this.onTap,
   });
 
@@ -1039,6 +1120,27 @@ class _ChatMediaBubble extends StatelessWidget {
                   Icons.play_circle_outline,
                   color: Colors.white70,
                   size: 48,
+                ),
+              if (uploadStatus == 'uploading')
+                Container(
+                  color: Colors.black38,
+                  child: const Center(
+                    child: SizedBox(
+                      width: 22,
+                      height: 22,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                  ),
+                ),
+              if (uploadStatus == 'failed')
+                Container(
+                  color: Colors.black45,
+                  child: Center(
+                    child: IconButton(
+                      icon: const Icon(Icons.refresh, color: Colors.white),
+                      onPressed: onRetry,
+                    ),
+                  ),
                 ),
             ],
           ),

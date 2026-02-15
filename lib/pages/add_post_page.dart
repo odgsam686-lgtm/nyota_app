@@ -408,6 +408,7 @@ Future<void> _saveDraft() async {
 
     final String postId = postInsert['id'].toString();
 
+    print("UPLOAD bucket=posts start user=${user.uid} isVideo=$_isVideo");
     // 2️⃣ Upload média (SUPABASE GÈRE LE THUMBNAIL)
     final mediaResult = await MediaUploadService.uploadMedia(
       file: _selectedFile!,
@@ -415,10 +416,19 @@ Future<void> _saveDraft() async {
       userId: postId, // 🔥 IMPORTANT
     );
 
-    // 3️⃣ Mettre à jour le post avec media_url
-    await supabase.from('posts').update({
+    print("DB INSERT media_path=${mediaResult['media_path']}");
+
+    // 3️⃣ Mettre à jour le post avec media + thumbnail + type
+    final updatePayload = {
       "media_url": mediaResult['media_url'],
-    }).eq('id', postId);
+      "thumbnail_url": mediaResult['thumbnail_url'],
+      "media_path": mediaResult['media_path'],
+      "thumbnail_path": mediaResult['thumbnail_path'],
+      "media_type": _isVideo ? "video" : "image",
+      "is_video": _isVideo,
+    };
+    debugPrint("post update payload=$updatePayload");
+    await supabase.from('posts').update(updatePayload).eq('id', postId);
 
     if (!mounted) return;
 

@@ -3,9 +3,15 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:video_thumbnail/video_thumbnail.dart';
 import 'package:path_provider/path_provider.dart';
 import '../utils/storage_url.dart';
+import 'package:flutter/foundation.dart';
 
 class MediaUploadService {
   static const String bucketName = 'posts';
+
+  static String _buildPath(String userId, String uploadId, String filename) {
+    // Always keep the bucket prefix inside the object path
+    return 'posts/$userId/$uploadId/$filename';
+  }
 
   static Future<Map<String, dynamic>> uploadMedia({
     required File file,
@@ -31,7 +37,8 @@ class MediaUploadService {
       if (thumbnailFilePath != null) {
         final thumbFile = File(thumbnailFilePath);
         if (thumbFile.existsSync()) {
-          thumbnailPath = 'posts/$userId/$uploadId/thumb.jpg';
+          thumbnailPath = _buildPath(userId, uploadId, 'thumb.jpg');
+          print("UPLOAD bucket=$bucketName path=$thumbnailPath");
           await supabase.storage
               .from(bucketName)
               .upload(thumbnailPath, thumbFile);
@@ -41,7 +48,8 @@ class MediaUploadService {
 
       // Upload video
       final ext = file.path.split('.').last;
-      mediaPath = 'posts/$userId/$uploadId/media.$ext';
+      mediaPath = _buildPath(userId, uploadId, 'media.$ext');
+      print("UPLOAD bucket=$bucketName path=$mediaPath");
       await supabase.storage.from(bucketName).upload(mediaPath, file);
       mediaUrl = storagePublicUrl(bucketName, mediaPath);
     }
@@ -51,7 +59,8 @@ class MediaUploadService {
     // ==========================
     else {
       final ext = file.path.split('.').last;
-      mediaPath = 'posts/$userId/$uploadId/media.$ext';
+      mediaPath = _buildPath(userId, uploadId, 'media.$ext');
+      print("UPLOAD bucket=$bucketName path=$mediaPath");
       await supabase.storage.from(bucketName).upload(mediaPath, file);
       mediaUrl = storagePublicUrl(bucketName, mediaPath);
     }

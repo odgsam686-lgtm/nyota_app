@@ -2,6 +2,7 @@
 import 'dart:io';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:flutter/foundation.dart';
 import '../models/draft_local_model.dart';
 import 'media_upload_service.dart';
 
@@ -90,6 +91,7 @@ class DraftPublishService {
         payload['video_variants'] = videoVariants;
       }
 
+      debugPrint("DB insert posts payload=$payload");
       final insert =
           await supabase.from('posts').insert(payload).select().single();
 

@@ -5,7 +5,7 @@ import 'chat_screen.dart';
 import 'package:nyota_app/pages/public_profile_page.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-class ConversationsListScreen extends StatelessWidget {
+class ConversationsListScreen extends StatefulWidget {
   final String currentUserId;
   static final Map<String, Map<String, dynamic>> _profileCache = {};
 
@@ -14,10 +14,18 @@ class ConversationsListScreen extends StatelessWidget {
     required this.currentUserId,
   });
 
+  @override
+  State<ConversationsListScreen> createState() => _ConversationsListScreenState();
+}
+
+class _ConversationsListScreenState extends State<ConversationsListScreen> {
+  final Map<String, int> _localUnreadOverride = {};
+  final Map<String, DateTime> _clearedAt = {};
+
   /// 🔹 Récupérer display_name/username/avatar_url depuis public_profiles
   Future<Map<String, dynamic>?> fetchUserProfile(String userId) async {
-    if (_profileCache.containsKey(userId)) {
-      return _profileCache[userId];
+    if (ConversationsListScreen._profileCache.containsKey(userId)) {
+      return ConversationsListScreen._profileCache[userId];
     }
     try {
       final publicProfile = await Supabase.instance.client
@@ -46,7 +54,7 @@ class ConversationsListScreen extends StatelessWidget {
                 ? fallback['photo_url']
                 : null,
           };
-          _profileCache[userId] = normalized;
+          ConversationsListScreen._profileCache[userId] = normalized;
           return normalized;
         }
         return null;
@@ -68,7 +76,7 @@ class ConversationsListScreen extends StatelessWidget {
             ? avatarUrl
             : null,
       };
-      _profileCache[userId] = normalized;
+      ConversationsListScreen._profileCache[userId] = normalized;
       return normalized;
     } catch (_) {
       return null;
@@ -113,15 +121,16 @@ class ConversationsListScreen extends StatelessWidget {
       body: NyotaBackground(
         child: StreamBuilder<List<Map<String, dynamic>>>(
           stream: supabase
-              .from('conversations')
-              .stream(primaryKey: ['id'])
+              .from('conversations_with_unread')
+              .stream(primaryKey: ['id', 'user_id'])
+              .eq('user_id', widget.currentUserId)
               .order('updated_at', ascending: false)
               .map((rows) {
                 final all = List<Map<String, dynamic>>.from(rows);
                 return all
                     .where((c) =>
-                        c['user_a'] == currentUserId ||
-                        c['user_b'] == currentUserId)
+                        c['user_a'] == widget.currentUserId ||
+                        c['user_b'] == widget.currentUserId)
                     .toList();
               }),
           builder: (context, snapshot) {
@@ -144,11 +153,36 @@ class ConversationsListScreen extends StatelessWidget {
               itemBuilder: (context, index) {
                 final convo = conversations[index];
 
-                final otherUserId = convo['user_a'] == currentUserId
+                final otherUserId = convo['user_a'] == widget.currentUserId
                     ? convo['user_b']
                     : convo['user_a'];
 
-                final bool hasUnread = (convo['unread_count'] ?? 0) > 0;
+                final int unreadCount = (convo['unread_count'] is int)
+                    ? convo['unread_count']
+                    : int.tryParse(convo['unread_count']?.toString() ?? '0') ?? 0;
+                final convoId = convo['id']?.toString() ?? '';
+                final override = _localUnreadOverride[convoId];
+                int effectiveUnread = override ?? unreadCount;
+                final clearedAt = _clearedAt[convoId];
+                DateTime? updatedAt;
+                try {
+                  final raw = convo['updated_at']?.toString();
+                  if (raw != null) updatedAt = DateTime.parse(raw);
+                } catch (_) {}
+                if (override != null &&
+                    clearedAt != null &&
+                    updatedAt != null &&
+                    updatedAt.isAfter(clearedAt)) {
+                  WidgetsBinding.instance.addPostFrameCallback((_) {
+                    if (!mounted) return;
+                    setState(() {
+                      _localUnreadOverride.remove(convoId);
+                      _clearedAt.remove(convoId);
+                    });
+                  });
+                  effectiveUnread = unreadCount;
+                }
+                final bool hasUnread = effectiveUnread > 0;
 
                 return FutureBuilder<Map<String, dynamic>?>(
                   future: fetchUserProfile(otherUserId),
@@ -158,7 +192,7 @@ class ConversationsListScreen extends StatelessWidget {
                     final avatarUrl = _getAvatarUrl(profile);
 
                     return FutureBuilder<String?>(
-                      future: _getDraftText(convo['id'], currentUserId),
+                      future: _getDraftText(convo['id'], widget.currentUserId),
                       builder: (context, draftSnap) {
                         final draft = draftSnap.data?.trim();
                         final hasDraft = draft != null && draft.isNotEmpty;
@@ -190,19 +224,6 @@ class ConversationsListScreen extends StatelessWidget {
                                       : null,
                                 ),
                               ),
-                              if (hasUnread)
-                                Positioned(
-                                  right: 0,
-                                  top: 0,
-                                  child: Container(
-                                    width: 10,
-                                    height: 10,
-                                    decoration: const BoxDecoration(
-                                      color: Colors.blue,
-                                      shape: BoxShape.circle,
-                                    ),
-                                  ),
-                                ),
                             ],
                           ),
                           title: Text(
@@ -218,14 +239,40 @@ class ConversationsListScreen extends StatelessWidget {
                                 ? const TextStyle(color: Colors.redAccent)
                                 : null,
                           ),
+                          trailing: hasUnread
+                              ? Container(
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 6, vertical: 2),
+                                  decoration: const BoxDecoration(
+                                    color: Colors.green,
+                                    shape: BoxShape.circle,
+                                  ),
+                                  child: Text(
+                                    effectiveUnread > 99
+                                        ? '99+'
+                                        : effectiveUnread.toString(),
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                )
+                              : null,
                           onTap: () {
+                            if (convoId.isNotEmpty) {
+                              setState(() {
+                                _localUnreadOverride[convoId] = 0;
+                                _clearedAt[convoId] = DateTime.now();
+                              });
+                            }
                             Navigator.push(
                               context,
                               MaterialPageRoute(
                                 builder: (_) => ChatScreen(
                                   conversationId: convo['id'],
                                   receiverId: otherUserId,
-                                  currentUserId: currentUserId,
+                                  currentUserId: widget.currentUserId,
                                   initialDisplayName: username,
                                   initialPhotoUrl: avatarUrl,
                                 ),

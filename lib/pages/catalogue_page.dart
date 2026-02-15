@@ -130,7 +130,14 @@ class _CatalogPageState extends State<CatalogPage> {
                           final dynamic rawVariants = p['video_variants'];
                           final Map<String, dynamic>? variants =
                               rawVariants is Map ? Map<String, dynamic>.from(rawVariants) : null;
-                          final type = p['media_type']; // image | video
+                          final dynamic rawThumb = p['thumbnail_url'] ?? p['thumbnail_path'];
+                          final String? thumbnailUrl = rawThumb != null &&
+                                  rawThumb.toString().isNotEmpty
+                              ? resolveMediaUrl(rawThumb.toString())
+                              : null;
+                          final bool isVideo = p['media_type'] == 'video' ||
+                              p['is_video'] == true ||
+                              p['is_video']?.toString() == 'true';
                           final title =
                               p['title'] ?? p['description'] ?? '';
 
@@ -163,10 +170,11 @@ class _CatalogPageState extends State<CatalogPage> {
                                 ),
 
                                 /// 🔐 DÉCISION FERME IMAGE / VIDÉO
-                                child: type == 'video'
+                                child: isVideo
                                     ? VideoPreviewTile(
                                         mediaPath: media,
                                         variants: variants,
+                                        thumbnailUrl: thumbnailUrl,
                                       )
                                     : CachedNetworkImage(
                                         imageUrl: resolvedMedia,
@@ -201,11 +209,13 @@ class _CatalogPageState extends State<CatalogPage> {
 class VideoPreviewTile extends StatefulWidget {
   final String mediaPath;
   final Map<String, dynamic>? variants;
+  final String? thumbnailUrl;
 
   const VideoPreviewTile({
     super.key,
     required this.mediaPath,
     this.variants,
+    this.thumbnailUrl,
   });
 
   @override
@@ -215,6 +225,7 @@ class VideoPreviewTile extends StatefulWidget {
 class _VideoPreviewTileState extends State<VideoPreviewTile> {
   VideoPlayerController? _controller;
   bool _ready = false;
+  bool _error = false;
 
   @override
   void initState() {
@@ -224,23 +235,37 @@ class _VideoPreviewTileState extends State<VideoPreviewTile> {
   }
 
   Future<void> _initController() async {
-    final resolvedUrl = await resolveBestVideoUrl(
-      mediaPath: widget.mediaPath,
-      variants: widget.variants,
-    );
-    final controller = createVideoController(resolvedUrl);
-    _controller = controller;
-    await controller.initialize();
-    controller
-      ..setVolume(0)
-      ..play();
+    if (widget.thumbnailUrl != null && widget.thumbnailUrl!.isNotEmpty) {
+      if (mounted) setState(() => _ready = true);
+      return;
+    }
+    try {
+      final resolvedUrl = await resolveBestVideoUrl(
+        mediaPath: widget.mediaPath,
+        variants: widget.variants,
+      ).timeout(const Duration(seconds: 6));
+      final controller = createVideoController(resolvedUrl);
+      _controller = controller;
+      await controller.initialize().timeout(const Duration(seconds: 6));
+      controller
+        ..setVolume(0)
+        ..play();
 
-    // ▶️ jouer 1 seconde pour afficher une frame
-    await Future.delayed(const Duration(seconds: 1));
-    controller.pause();
+      // ▶️ jouer 1 seconde pour afficher une frame
+      await Future.delayed(const Duration(seconds: 1));
+      controller.pause();
 
-    if (mounted) {
-      setState(() => _ready = true);
+      if (mounted) {
+        setState(() => _ready = true);
+      }
+    } catch (e) {
+      debugPrint("VideoPreviewTile error: $e");
+      if (mounted) {
+        setState(() {
+          _ready = true;
+          _error = true;
+        });
+      }
     }
   }
 
@@ -258,12 +283,31 @@ class _VideoPreviewTileState extends State<VideoPreviewTile> {
 
   @override
   Widget build(BuildContext context) {
+    if (widget.thumbnailUrl != null &&
+        widget.thumbnailUrl!.isNotEmpty) {
+      return CachedNetworkImage(
+        imageUrl: widget.thumbnailUrl!,
+        fit: BoxFit.cover,
+        placeholder: (_, __) =>
+            const Center(child: CircularProgressIndicator(strokeWidth: 2)),
+        errorWidget: (_, __, ___) => Container(
+          color: Colors.grey.shade300,
+          child: const Icon(Icons.broken_image),
+        ),
+      );
+    }
     if (!_ready || _controller == null) {
       return Container(
         color: Colors.grey.shade300,
         child: const Center(
           child: CircularProgressIndicator(strokeWidth: 2),
         ),
+      );
+    }
+    if (_error) {
+      return Container(
+        color: Colors.grey.shade300,
+        child: const Icon(Icons.broken_image),
       );
     }
 

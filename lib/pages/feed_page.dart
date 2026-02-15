@@ -28,6 +28,7 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
 
   // Video controllers keyed by postId (stabler que par index)
   final Map<String, VideoPlayerController> videoControllers = {};
+  final Set<String> _loggedPosts = {};
 
   // Pour animation like
   final Set<String> likedLocal = {}; // posts liked locally (UI)
@@ -87,7 +88,7 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
       res = await supabase
           .from('posts')
           .select(
-              'id, seller_id, seller_name, avatar_url, media_url, video_variants, is_video, description, timestamp, likes')
+              'id, seller_id, seller_name, avatar_url, media_url, thumbnail_url, thumbnail_path, video_variants, is_video, description, timestamp, likes')
           .order('timestamp', ascending: false)
           .range(from, to);
 
@@ -98,13 +99,20 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
       } else {
         for (var r in res) {
           r['id'] = r['id']?.toString();
-          r['likes'] = (r['likes'] is int)
-              ? r['likes']
-              : int.tryParse(r['likes']?.toString() ?? "0") ?? 0;
+              r['likes'] = (r['likes'] is int)
+                  ? r['likes']
+                  : int.tryParse(r['likes']?.toString() ?? "0") ?? 0;
 
-          posts.add(r);
-          localLikes[r['id']] = r['likes'];
-        }
+              posts.add(r);
+              localLikes[r['id']] = r['likes'];
+
+              final id = r['id']?.toString();
+              if (id != null && !_loggedPosts.contains(id)) {
+                _loggedPosts.add(id);
+                debugPrint(
+                    "FEED render post=$id is_video=${r['is_video']} media_url=${r['media_url']} thumb=${r['thumbnail_url'] ?? r['thumbnail_path']} variants=${r['video_variants'] != null}");
+              }
+            }
 
         if (posts.length <= 2) {
           _maybeInitAroundIndex(0);
@@ -407,6 +415,11 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
                 final rawMediaUrl = doc['media_url']?.toString();
                 final mediaUrl =
                     rawMediaUrl == null ? null : resolveMediaUrl(rawMediaUrl);
+                final rawThumb = doc['thumbnail_url'] ?? doc['thumbnail_path'];
+                final thumbnailUrl = rawThumb != null &&
+                        rawThumb.toString().isNotEmpty
+                    ? resolveMediaUrl(rawThumb.toString())
+                    : null;
                 final isVideo = doc['is_video'] == true ||
                     (doc['is_video']?.toString() == 'true');
                 final sellerName = doc['seller_name'] ?? 'Utilisateur';
@@ -458,7 +471,7 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
                   fit: StackFit.expand,
                   children: [
                     if (isVideo && mediaUrl != null && mediaUrl.isNotEmpty)
-                      _buildVideoWidget(postId, mediaUrl)
+                      _buildVideoWidget(postId, mediaUrl, thumbnailUrl)
                     else if (mediaUrl != null && mediaUrl.isNotEmpty)
                       CachedNetworkImage(
                         imageUrl: mediaUrl,
@@ -568,27 +581,44 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
     );
   }
 
-  Widget _buildVideoWidget(String postId, String mediaUrl) {
+  Widget _buildVideoWidget(String postId, String mediaUrl, String? thumbnailUrl) {
     final controller = videoControllers[postId];
     if (controller == null) {
       final idx = posts.indexWhere((d) => d['id']?.toString() == postId);
       if (idx != -1) _initializeVideoForIndex(idx);
 
-      return Center(
-        child: CachedNetworkImage(
-          imageUrl: mediaUrl,
-          fit: BoxFit.cover,
-          width: double.infinity,
-          height: double.infinity,
-          placeholder: (c, s) =>
-              const Center(child: CircularProgressIndicator()),
-          errorWidget: (c, s, e) =>
-              const Center(child: Icon(Icons.broken_image)),
-        ),
-      );
+      if (thumbnailUrl != null && thumbnailUrl.isNotEmpty) {
+        return Center(
+          child: CachedNetworkImage(
+            imageUrl: thumbnailUrl,
+            fit: BoxFit.cover,
+            width: double.infinity,
+            height: double.infinity,
+            placeholder: (c, s) =>
+                const Center(child: CircularProgressIndicator()),
+            errorWidget: (c, s, e) =>
+                const Center(child: Icon(Icons.broken_image)),
+          ),
+        );
+      }
+      return const Center(child: Icon(Icons.broken_image));
     }
 
     if (!controller.value.isInitialized) {
+      if (thumbnailUrl != null && thumbnailUrl.isNotEmpty) {
+        return Center(
+          child: CachedNetworkImage(
+            imageUrl: thumbnailUrl,
+            fit: BoxFit.cover,
+            width: double.infinity,
+            height: double.infinity,
+            placeholder: (c, s) =>
+                const Center(child: CircularProgressIndicator()),
+            errorWidget: (c, s, e) =>
+                const Center(child: Icon(Icons.broken_image)),
+          ),
+        );
+      }
       return const Center(child: CircularProgressIndicator());
     }
 

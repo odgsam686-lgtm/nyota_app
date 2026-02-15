@@ -32,6 +32,7 @@ import 'package:nyota_app/pages/home_page_with_online_status.dart';
 import 'package:supabase_flutter/supabase_flutter.dart' as supa;
 import 'package:nyota_app/pages/forgot_password_phone_page.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:nyota_app/services/unread_counter_service.dart';
 
 final RouteObserver<ModalRoute<void>> routeObserver =
     RouteObserver<ModalRoute<void>>();
@@ -1019,6 +1020,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     _loadUserData();
     _getUserLocation();
     _deepLinkService.init(context);
+    UnreadCounterService.instance.start(widget.user.uid);
     // charger les produits locaux immédiatement (si box contient)
     final localProducts = legacy.OfflineManager.getLocalProducts();
     if (localProducts.isNotEmpty) {
@@ -1045,6 +1047,12 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     // lance une sync en tâche de fond (si connecté)
     legacy.OfflineManager.syncProductsWithFirestore()
         .catchError((e) => debugPrint('Sync err: $e'));
+  }
+
+  @override
+  void dispose() {
+    UnreadCounterService.instance.stop();
+    super.dispose();
   }
 
   Future<void> _loadUserData() async {
@@ -1388,11 +1396,43 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
             Positioned(
               bottom: 16,
               right: 16,
-              child: FloatingActionButton(
-                heroTag: 'chatBtn',
-                onPressed: _openConversationsList,
-                child: const Icon(Icons.chat),
-                tooltip: 'Mes messages',
+              child: ValueListenableBuilder<int>(
+                valueListenable: UnreadCounterService.instance.totalUnread,
+                builder: (context, totalUnread, _) {
+                  final label = totalUnread > 99 ? '99+' : '$totalUnread';
+                  return Stack(
+                    clipBehavior: Clip.none,
+                    children: [
+                      FloatingActionButton(
+                        heroTag: 'chatBtn',
+                        onPressed: _openConversationsList,
+                        child: const Icon(Icons.chat),
+                        tooltip: 'Mes messages',
+                      ),
+                      if (totalUnread > 0)
+                        Positioned(
+                          top: -4,
+                          right: -4,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 6, vertical: 2),
+                            decoration: BoxDecoration(
+                              color: Colors.red,
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                            child: Text(
+                              label,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 11,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ),
+                        ),
+                    ],
+                  );
+                },
               ),
             ),
           if (_currentIndex == 2)
