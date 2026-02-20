@@ -33,9 +33,14 @@ import 'package:supabase_flutter/supabase_flutter.dart' as supa;
 import 'package:nyota_app/pages/forgot_password_phone_page.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:nyota_app/services/unread_counter_service.dart';
+import 'package:nyota_app/services/notification_service.dart';
+import 'package:nyota_app/widgets/badge.dart';
 
 final RouteObserver<ModalRoute<void>> routeObserver =
     RouteObserver<ModalRoute<void>>();
+final GlobalKey<NavigatorState> appNavigatorKey = GlobalKey<NavigatorState>();
+final GlobalKey<ScaffoldMessengerState> appScaffoldMessengerKey =
+    GlobalKey<ScaffoldMessengerState>();
 
 void main() async {
   WidgetsBinding widgetsBinding = WidgetsFlutterBinding.ensureInitialized();
@@ -120,7 +125,13 @@ class MyApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    NotificationService.instance.bind(
+      navigatorKey: appNavigatorKey,
+      messengerKey: appScaffoldMessengerKey,
+    );
     return MaterialApp(
+      navigatorKey: appNavigatorKey,
+      scaffoldMessengerKey: appScaffoldMessengerKey,
       navigatorObservers: [routeObserver],
       title: '',
       debugShowCheckedModeBanner: false,
@@ -1021,6 +1032,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     _getUserLocation();
     _deepLinkService.init(context);
     UnreadCounterService.instance.start(widget.user.uid);
+    NotificationService.instance.initForUser(widget.user.uid);
     // charger les produits locaux immédiatement (si box contient)
     final localProducts = legacy.OfflineManager.getLocalProducts();
     if (localProducts.isNotEmpty) {
@@ -1052,6 +1064,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   @override
   void dispose() {
     UnreadCounterService.instance.stop();
+    NotificationService.instance.dispose();
     super.dispose();
   }
 
@@ -1399,38 +1412,14 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
               child: ValueListenableBuilder<int>(
                 valueListenable: UnreadCounterService.instance.totalUnread,
                 builder: (context, totalUnread, _) {
-                  final label = totalUnread > 99 ? '99+' : '$totalUnread';
-                  return Stack(
-                    clipBehavior: Clip.none,
-                    children: [
-                      FloatingActionButton(
-                        heroTag: 'chatBtn',
-                        onPressed: _openConversationsList,
-                        child: const Icon(Icons.chat),
-                        tooltip: 'Mes messages',
-                      ),
-                      if (totalUnread > 0)
-                        Positioned(
-                          top: -4,
-                          right: -4,
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(
-                                horizontal: 6, vertical: 2),
-                            decoration: BoxDecoration(
-                              color: Colors.red,
-                              borderRadius: BorderRadius.circular(10),
-                            ),
-                            child: Text(
-                              label,
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 11,
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-                          ),
-                        ),
-                    ],
+                  return BadgeWidget(
+                    count: totalUnread,
+                    child: FloatingActionButton(
+                      heroTag: 'chatBtn',
+                      onPressed: _openConversationsList,
+                      child: const Icon(Icons.chat),
+                      tooltip: 'Mes messages',
+                    ),
                   );
                 },
               ),

@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'dart:async';
 
 class UnreadCounterService {
   UnreadCounterService._();
@@ -8,7 +9,7 @@ class UnreadCounterService {
 
   final ValueNotifier<int> totalUnread = ValueNotifier<int>(0);
 
-  RealtimeChannel? _channel;
+  StreamSubscription<List<Map<String, dynamic>>>? _unreadSub;
   String? _userId;
   bool _refreshing = false;
 
@@ -17,36 +18,35 @@ class UnreadCounterService {
       stop();
       return;
     }
-    if (_userId == userId && _channel != null) return;
+    if (_userId == userId && _unreadSub != null) return;
     stop();
     _userId = userId;
-    _refresh();
 
-    _channel = Supabase.instance.client
-        .channel('unread_counter_$userId')
-      ..on(
-        RealtimeListenTypes.postgresChanges,
-        ChannelFilter(event: '*', schema: 'public', table: 'messages'),
-        (payload, [ref]) => _refresh(),
-      )
-      ..on(
-        RealtimeListenTypes.postgresChanges,
-        ChannelFilter(
-          event: '*',
-          schema: 'public',
-          table: 'conversation_reads',
-          filter: 'user_id=eq.$userId',
-        ),
-        (payload, [ref]) => _refresh(),
-      )
-      ..subscribe();
+    // ✅ Compteur temps-réel direct sur les messages non lus
+    _unreadSub = Supabase.instance.client
+        .from('messages')
+        .stream(primaryKey: ['id'])
+        .eq('receiver_id', userId)
+        .listen((rows) {
+      int count = 0;
+      for (final row in rows) {
+        final readAt = row['read_at'];
+        final senderId = row['sender_id']?.toString();
+        if (readAt == null && senderId != userId) {
+          count++;
+        }
+      }
+      totalUnread.value = count;
+    }, onError: (e) {
+      debugPrint('UnreadCounter unread stream error: $e');
+    });
   }
 
   void stop() {
-    _channel?.unsubscribe();
-    _channel = null;
+    _unreadSub?.cancel();
+    _unreadSub = null;
     _userId = null;
-    totalUnread.value = 0;
+    totalUnread.value = 0; 
   }
 
   Future<void> _refresh() async {

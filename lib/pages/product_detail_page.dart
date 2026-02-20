@@ -3,6 +3,7 @@ import 'package:cached_network_image/cached_network_image.dart';
 import 'package:video_player/video_player.dart';
 import '../widgets/fullscreen_media_actions.dart';
 import '../utils/media_resolver.dart';
+import 'comments_page.dart';
 
 class ProductDetailPage extends StatefulWidget {
   final Map<String, dynamic> product;
@@ -214,11 +215,7 @@ Future<void> _initVideoController(
                 // même logique que le feed
               },
               onComment: () {
-                Navigator.pushNamed(
-                  context,
-                  '/comments',
-                  arguments: widget.product['id'],
-                );
+                openComments(context, widget.product['id']);
               },
               onOpenProfile: () {
                 Navigator.pushNamed(

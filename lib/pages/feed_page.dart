@@ -7,6 +7,7 @@ import 'package:video_player/video_player.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../widgets/fullscreen_media_actions.dart';
 import '../utils/media_resolver.dart';
+import 'comments_page.dart';
 
 class FeedPage extends StatefulWidget {
   const FeedPage({super.key});
@@ -403,7 +404,8 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
           PageView.builder(
             controller: _pageController,
             scrollDirection: Axis.vertical,
-            physics: const ClampingScrollPhysics(),
+            pageSnapping: true,
+            physics: const PageScrollPhysics(),
             itemCount: posts.length,
             onPageChanged: _onPageChanged,
             itemBuilder: (context, index) {
@@ -633,7 +635,7 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
   }
 
   void _openComments(String postId) {
-    Navigator.pushNamed(context, '/comments', arguments: postId);
+    openComments(context, postId);
   }
 
   void _openProduct(Map<String, dynamic> data) {

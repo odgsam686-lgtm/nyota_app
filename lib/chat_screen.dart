@@ -11,6 +11,7 @@ import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:video_player/video_player.dart';
 import 'package:nyota_app/services/video_thumbnail_service.dart';
+import 'package:nyota_app/services/notification_service.dart';
 
 final ScrollController _scrollController = ScrollController();
 
@@ -59,6 +60,7 @@ class _ChatScreenState extends State<ChatScreen> {
   void initState() {
     super.initState();
     currentUserId = FirebaseAuth.instance.currentUser!.uid;
+    NotificationService.instance.setActiveConversationId(widget.conversationId);
     _receiverDisplayName =
         widget.initialDisplayName?.trim().isNotEmpty == true
             ? widget.initialDisplayName
@@ -490,6 +492,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _draftTimer?.cancel();
     _pendingVideoController?.dispose();
     _setTyping(false);
+    NotificationService.instance.setActiveConversationId(null);
     super.dispose();
   }
 
@@ -502,7 +505,7 @@ class _ChatScreenState extends State<ChatScreen> {
         })
         .eq('conversation_id', widget.conversationId)
         .neq('sender_id', currentUserId)
-        .eq('is_read', false);
+        .or('is_read.is.false,is_read.is.null');
     await _touchConversationRead();
   }
 
