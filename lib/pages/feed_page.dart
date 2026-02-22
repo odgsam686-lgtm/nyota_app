@@ -1,4 +1,6 @@
 // feed_page_supabase.dart
+import 'dart:async';
+
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
@@ -25,11 +27,19 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
   bool isLoading = false;
   bool hasMore = true;
   final int limit = 6; // ajustable
-  bool _isFastScrolling = false;
 
   // Video controllers keyed by postId (stabler que par index)
   final Map<String, VideoPlayerController> videoControllers = {};
+  final Map<String, int> _videoInitEpoch = {};
+  final Set<String> _videoInitInFlight = {};
+  final Set<String> _videoInitFailed = {};
+  final Map<String, DateTime> _videoRetryAfter = {};
   final Set<String> _loggedPosts = {};
+  static const Duration _viewThreshold = Duration(seconds: 2);
+  Timer? _viewTimer;
+  String? _pendingViewPostId;
+  final Set<String> _viewRegisteredPosts = {};
+  final Set<String> _viewInFlightPosts = {};
 
   // Pour animation like
   final Set<String> likedLocal = {}; // posts liked locally (UI)
@@ -52,6 +62,7 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
 
   @override
   void dispose() {
+    _cancelViewTimer();
     WidgetsBinding.instance.removeObserver(this);
     _pageController.dispose();
     for (var c in videoControllers.values) {
@@ -61,6 +72,10 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
       } catch (_) {}
     }
     videoControllers.clear();
+    _videoInitEpoch.clear();
+    _videoInitInFlight.clear();
+    _videoInitFailed.clear();
+    _videoRetryAfter.clear();
     super.dispose();
   }
 
@@ -68,6 +83,7 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.inactive) {
+      _cancelViewTimer();
       _pauseAllVideos();
     } else if (state == AppLifecycleState.resumed) {
       _playCurrentIfNeeded();
@@ -89,7 +105,7 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
       res = await supabase
           .from('posts')
           .select(
-              'id, seller_id, seller_name, avatar_url, media_url, thumbnail_url, thumbnail_path, video_variants, is_video, description, timestamp, likes')
+              'id, seller_id, media_url, thumbnail_url, thumbnail_path, video_variants, is_video, timestamp')
           .order('timestamp', ascending: false)
           .range(from, to);
 
@@ -98,53 +114,108 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
       if (res.isEmpty) {
         hasMore = false;
       } else {
+        final loadedIds = <String>[];
         for (var r in res) {
           r['id'] = r['id']?.toString();
-              r['likes'] = (r['likes'] is int)
-                  ? r['likes']
-                  : int.tryParse(r['likes']?.toString() ?? "0") ?? 0;
+          final id = r['id']?.toString();
+          if (id == null || id.isEmpty) continue;
 
-              posts.add(r);
-              localLikes[r['id']] = r['likes'];
+          // Phase 1: minimal payload for instant media rendering.
+          final post = <String, dynamic>{
+            'id': id,
+            'seller_id': r['seller_id'],
+            'media_url': r['media_url'],
+            'thumbnail_url': r['thumbnail_url'],
+            'thumbnail_path': r['thumbnail_path'],
+            'video_variants': r['video_variants'],
+            'is_video': r['is_video'],
+            'timestamp': r['timestamp'],
+            // Phase 2 fields start with lightweight defaults.
+            'seller_name': 'Utilisateur',
+            'avatar_url': null,
+            'description': '',
+            'comments_count': 0,
+            'likes': 0,
+          };
 
-              final id = r['id']?.toString();
-              if (id != null && !_loggedPosts.contains(id)) {
-                _loggedPosts.add(id);
-                debugPrint(
-                    "FEED render post=$id is_video=${r['is_video']} media_url=${r['media_url']} thumb=${r['thumbnail_url'] ?? r['thumbnail_path']} variants=${r['video_variants'] != null}");
-              }
-            }
+          posts.add(post);
+          localLikes[id] = 0;
+          loadedIds.add(id);
 
-        if (posts.length <= 2) {
-          _maybeInitAroundIndex(0);
+          if (!_loggedPosts.contains(id)) {
+            _loggedPosts.add(id);
+            debugPrint(
+                "FEED render post=$id is_video=${post['is_video']} media_url=${post['media_url']} thumb=${post['thumbnail_url'] ?? post['thumbnail_path']} variants=${post['video_variants'] != null}");
+          }
+        }
+
+        // Phase 2: hydrate non-video metadata asynchronously.
+        _hydratePostMeta(loadedIds);
+
+        if (from == 0 && posts.isNotEmpty) {
+          _maybeInitAroundIndex(currentIndex);
+          _playCurrentIfNeeded();
         }
       }
 
       // ⚠️ precacheImage utilise CONTEXT → mounted obligatoire
       if (!mounted) return;
 
-        for (var r in res) {
-          final rawMediaUrl = r['media_url']?.toString() ?? '';
-          final isVideo = r['is_video'] == true;
+      for (var r in res) {
+        final rawMediaUrl = r['media_url']?.toString() ?? '';
+        final isVideo = r['is_video'] == true;
 
-          if (!isVideo && rawMediaUrl.isNotEmpty) {
-            final mediaUrl = resolveMediaUrl(rawMediaUrl);
-            precacheImage(
-              CachedNetworkImageProvider(mediaUrl),
-              context,
-            );
+        if (!isVideo && rawMediaUrl.isNotEmpty) {
+          final mediaUrl = resolveMediaUrl(rawMediaUrl);
+          precacheImage(
+            CachedNetworkImageProvider(mediaUrl),
+            context,
+          );
         }
       }
     } catch (e, st) {
       debugPrint("Erreur load posts : $e\n$st");
     } finally {
-      if (!mounted) return;
-      setState(() => isLoading = false);
+      if (mounted) {
+        setState(() => isLoading = false);
+      }
     }
 
-    // ❗ IMPORTANT : async + possible navigation
+    // Keep likes loading non-blocking so video init remains priority.
     if (!mounted) return;
-    await _loadLikesForPosts();
+    _loadLikesForPosts();
+  }
+
+  Future<void> _hydratePostMeta(List<String> ids) async {
+    if (ids.isEmpty) return;
+    try {
+      final rows = await supabase
+          .from('posts')
+          .select('id, seller_name, avatar_url, description, comments_count')
+          .inFilter('id', ids);
+      if (!mounted) return;
+      final byId = <String, Map<String, dynamic>>{};
+      for (final row in rows) {
+        final id = row['id']?.toString();
+        if (id == null || id.isEmpty) continue;
+        byId[id] = Map<String, dynamic>.from(row);
+      }
+      if (byId.isEmpty) return;
+      setState(() {
+        for (final p in posts) {
+          final id = p['id']?.toString();
+          if (id == null) continue;
+          final m = byId[id];
+          if (m == null) continue;
+          p['seller_name'] = m['seller_name'] ?? p['seller_name'];
+          p['avatar_url'] = m['avatar_url'];
+          p['description'] = m['description'] ?? p['description'];
+          p['comments_count'] = m['comments_count'] ?? p['comments_count'];
+        }
+      });
+    } catch (e) {
+      debugPrint('Erreur hydrate post meta: $e');
+    }
   }
 
   Future<void> _initializeVideoForIndex(int index) async {
@@ -160,27 +231,101 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
 
     if (!isVideo || mediaPath.isEmpty) return;
     if (videoControllers.containsKey(postId)) return;
+    if (_videoInitInFlight.contains(postId)) return;
+    final blockedUntil = _videoRetryAfter[postId];
+    if (blockedUntil != null && DateTime.now().isBefore(blockedUntil)) return;
+
+    _videoInitInFlight.add(postId);
+    final epoch = DateTime.now().microsecondsSinceEpoch;
+    _videoInitEpoch[postId] = epoch;
 
     try {
       final resolvedUrl = await resolveBestVideoUrl(
         mediaPath: mediaPath,
         variants: variants,
       );
-      final controller = createVideoController(resolvedUrl);
+      if (_videoInitEpoch[postId] != epoch) return;
+      final urls = <String>[];
+      urls.add(resolvedUrl);
+      final fallbackUrl = resolveMediaUrl(mediaPath);
+      if (!urls.contains(fallbackUrl)) {
+        urls.add(fallbackUrl);
+      }
+
+      VideoPlayerController? controller;
+      Object? lastError;
+      for (final url in urls) {
+        VideoPlayerController? testController;
+        try {
+          testController = createVideoController(url);
+          await testController.initialize();
+          controller = testController;
+          break;
+        } catch (e) {
+          try {
+            await testController?.dispose();
+          } catch (_) {}
+          lastError = e;
+        }
+      }
+      if (controller == null) {
+        throw lastError ?? Exception('Video source error');
+      }
+
+      if (_videoInitEpoch[postId] != epoch) {
+        try {
+          controller.dispose();
+        } catch (_) {}
+        return;
+      }
       videoControllers[postId] = controller;
-      await controller.initialize();
       controller.setLooping(true);
+      _videoInitFailed.remove(postId);
+      _videoRetryAfter.remove(postId);
+      if (currentIndex < posts.length &&
+          posts[currentIndex]['id']?.toString() == postId) {
+        controller.play();
+        _scheduleViewForCurrentPost();
+      }
       setState(() {});
     } catch (e) {
       debugPrint("Erreur init video ($postId): $e");
+      _videoInitFailed.add(postId);
+      _videoRetryAfter[postId] = DateTime.now().add(const Duration(seconds: 8));
       videoControllers.remove(postId);
+      _videoInitEpoch.remove(postId);
+    } finally {
+      _videoInitInFlight.remove(postId);
     }
   }
 
   void _maybeInitAroundIndex(int index) {
-    _initializeVideoForIndex(index); // actuel
-    _initializeVideoForIndex(index + 1); // prochain
-    _initializeVideoForIndex(index - 1); // précédent
+    _initializeVideoForIndex(index); // current
+    _initializeVideoForIndex(index + 1); // next
+    _pruneVideoControllers(index);
+  }
+
+  void _pruneVideoControllers(int index) {
+    final keep = <String>{};
+    for (final i in [index, index + 1]) {
+      if (i >= 0 && i < posts.length) {
+        final id = posts[i]['id']?.toString();
+        if (id != null && id.isNotEmpty) keep.add(id);
+      }
+    }
+    final ids = videoControllers.keys.toList();
+    for (final id in ids) {
+      if (keep.contains(id)) continue;
+      final c = videoControllers.remove(id);
+      _videoInitEpoch.remove(id);
+      _videoInitInFlight.remove(id);
+      if (c != null) {
+        try {
+          c.pause();
+          c.dispose();
+        } catch (_) {}
+      }
+    }
   }
 
   void _pauseVideoByIndex(int index) {
@@ -188,7 +333,12 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
     final id = posts[index]['id']?.toString();
     if (id == null) return;
     final c = videoControllers[id];
-    if (c != null && c.value.isPlaying) c.pause();
+    if (c != null && c.value.isPlaying) {
+      c.pause();
+      if (index == currentIndex) {
+        _cancelViewTimer();
+      }
+    }
   }
 
   void _pauseAllVideos() {
@@ -197,6 +347,91 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
         if (c.value.isPlaying) c.pause();
       } catch (_) {}
     }
+    _cancelViewTimer();
+  }
+
+  bool _isVideoPost(Map<String, dynamic> post) {
+    return post['is_video'] == true || (post['is_video']?.toString() == 'true');
+  }
+
+  void _cancelViewTimer() {
+    _viewTimer?.cancel();
+    _viewTimer = null;
+    _pendingViewPostId = null;
+  }
+
+  Future<void> _registerViewForPost(String postId) async {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid == null) return;
+    if (_viewRegisteredPosts.contains(postId)) return;
+    if (_viewInFlightPosts.contains(postId)) return;
+
+    _viewInFlightPosts.add(postId);
+    bool success = false;
+    try {
+      try {
+        await supabase.from('post_views').upsert(
+          {
+            'post_id': postId,
+            'viewer_id': uid,
+            'created_at': DateTime.now().toIso8601String(),
+          },
+          onConflict: 'post_id,viewer_id',
+        );
+        success = true;
+      } catch (_) {
+        final exists = await supabase
+            .from('post_views')
+            .select('id')
+            .eq('post_id', postId)
+            .eq('viewer_id', uid)
+            .limit(1);
+        if (exists.isEmpty) {
+          await supabase.from('post_views').insert({
+            'post_id': postId,
+            'viewer_id': uid,
+            'created_at': DateTime.now().toIso8601String(),
+          });
+        }
+        success = true;
+      }
+    } catch (e) {
+      debugPrint("FEED view register error post=$postId user=$uid error=$e");
+    } finally {
+      if (success) {
+        _viewRegisteredPosts.add(postId);
+      }
+      _viewInFlightPosts.remove(postId);
+    }
+  }
+
+  void _scheduleViewForCurrentPost() {
+    _cancelViewTimer();
+    if (currentIndex < 0 || currentIndex >= posts.length) return;
+
+    final post = posts[currentIndex];
+    if (!_isVideoPost(post)) return;
+    final postId = post['id']?.toString();
+    if (postId == null || postId.isEmpty) return;
+    if (_viewRegisteredPosts.contains(postId)) return;
+    if (_viewInFlightPosts.contains(postId)) return;
+
+    _pendingViewPostId = postId;
+    _viewTimer = Timer(_viewThreshold, () async {
+      if (!mounted) return;
+      if (_pendingViewPostId != postId) return;
+      if (currentIndex < 0 || currentIndex >= posts.length) return;
+      final currentPostId = posts[currentIndex]['id']?.toString();
+      if (currentPostId != postId) return;
+
+      final controller = videoControllers[postId];
+      if (controller == null ||
+          !controller.value.isInitialized ||
+          !controller.value.isPlaying) {
+        return;
+      }
+      await _registerViewForPost(postId);
+    });
   }
 
   void openPublicProfile(String sellerId) {
@@ -215,90 +450,29 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
       if (id == null) return;
 
       final c = videoControllers[id];
-      if (c != null && c.value.isInitialized && !c.value.isPlaying) {
-        c.play();
+      if (c == null) {
+        _initializeVideoForIndex(currentIndex);
+        return;
+      }
+      if (c.value.isInitialized) {
+        if (!c.value.isPlaying) {
+          c.play();
+        }
+        _scheduleViewForCurrentPost();
       }
     });
   }
 
   void _onPageChanged(int index) {
-    _isFastScrolling = true;
-
+    _cancelViewTimer();
     _pauseVideoByIndex(currentIndex);
     currentIndex = index;
-
-    // ⏱️ On attend que le scroll se stabilise
-    Future.delayed(const Duration(milliseconds: 120), () {
-      if (!mounted) return;
-
-      _isFastScrolling = false;
-      _maybeInitAroundIndex(index);
-      _playCurrentIfNeeded();
-    });
+    _maybeInitAroundIndex(index);
+    _playCurrentIfNeeded();
 
     if (index >= posts.length - 3) {
       _loadMorePosts();
     }
-  }
-
-  void _playCurrentIfReady() {
-    final postId = posts[currentIndex]['id'].toString();
-    final controller = videoControllers[postId];
-
-    if (controller != null &&
-        controller.value.isInitialized &&
-        !controller.value.isPlaying) {
-      controller.play(); // ⚡ instantané
-    }
-  }
-
-  Future<void> _initVideoIfNeeded(int index) async {
-    if (index < 0 || index >= posts.length) return;
-
-    final post = posts[index];
-    final postId = post['id'].toString();
-    final mediaPath = post['media_url']?.toString() ?? '';
-    final dynamic rawVariants = post['video_variants'];
-    final Map<String, dynamic>? variants =
-        rawVariants is Map ? Map<String, dynamic>.from(rawVariants) : null;
-    final isVideo = post['is_video'] == true;
-
-    if (!isVideo || mediaPath.isEmpty) return;
-    if (videoControllers.containsKey(postId)) return;
-
-    try {
-      final resolvedUrl = await resolveBestVideoUrl(
-        mediaPath: mediaPath,
-        variants: variants,
-      );
-      final controller = createVideoController(resolvedUrl);
-      videoControllers[postId] = controller;
-
-      await controller.initialize(); // 🔥 LE SECRET
-      controller.setLooping(true);
-    } catch (e) {
-      videoControllers.remove(postId);
-    }
-  }
-
-  Future<void> _refreshFeed() async {
-    setState(() {
-      posts.clear();
-      hasMore = true;
-      isLoading = false;
-    });
-
-    for (var c in videoControllers.values) {
-      try {
-        c.pause();
-        c.dispose();
-      } catch (_) {}
-    }
-    videoControllers.clear();
-    localLikes.clear();
-    likedLocal.clear();
-
-    await _loadMorePosts();
   }
 
   // -------------------- LIKE (animation + update supabase) --------------------
@@ -409,22 +583,17 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
             itemCount: posts.length,
             onPageChanged: _onPageChanged,
             itemBuilder: (context, index) {
-              if (_isFastScrolling) {
-                return const ColoredBox(color: Colors.black);
-              }
-
               final doc = posts[index];
-                final rawMediaUrl = doc['media_url']?.toString();
-                final mediaUrl =
-                    rawMediaUrl == null ? null : resolveMediaUrl(rawMediaUrl);
-                final rawThumb = doc['thumbnail_url'] ?? doc['thumbnail_path'];
-                final thumbnailUrl = rawThumb != null &&
-                        rawThumb.toString().isNotEmpty
-                    ? resolveMediaUrl(rawThumb.toString())
-                    : null;
-                final isVideo = doc['is_video'] == true ||
-                    (doc['is_video']?.toString() == 'true');
-                final sellerName = doc['seller_name'] ?? 'Utilisateur';
+              final rawMediaUrl = doc['media_url']?.toString();
+              final mediaUrl =
+                  rawMediaUrl == null ? null : resolveMediaUrl(rawMediaUrl);
+              final rawThumb = doc['thumbnail_url'] ?? doc['thumbnail_path'];
+              final thumbnailUrl =
+                  rawThumb != null && rawThumb.toString().isNotEmpty
+                      ? resolveMediaUrl(rawThumb.toString())
+                      : null;
+              final isVideo = doc['is_video'] == true ||
+                  (doc['is_video']?.toString() == 'true');
               final sellerId = doc['seller_id'];
               final description = doc['description'] ?? '';
               final postId = doc['id']?.toString() ?? index.toString();
@@ -456,13 +625,17 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
 
                 // ✅ SIMPLE TAP = PLAY / PAUSE
                 onTap: () {
-                    if (isVideo && mediaUrl != null && mediaUrl.isNotEmpty) {
-                      final ctrl = videoControllers[postId];
-                      if (ctrl != null && ctrl.value.isInitialized) {
-                        if (ctrl.value.isPlaying) {
+                  if (isVideo && mediaUrl != null && mediaUrl.isNotEmpty) {
+                    final ctrl = videoControllers[postId];
+                    if (ctrl != null && ctrl.value.isInitialized) {
+                      if (ctrl.value.isPlaying) {
                         ctrl.pause();
+                        _cancelViewTimer();
                       } else {
                         ctrl.play();
+                        if (currentIndex == index) {
+                          _scheduleViewForCurrentPost();
+                        }
                       }
                       setState(() {});
                     }
@@ -583,45 +756,25 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
     );
   }
 
-  Widget _buildVideoWidget(String postId, String mediaUrl, String? thumbnailUrl) {
+  Widget _buildVideoWidget(
+      String postId, String mediaUrl, String? thumbnailUrl) {
     final controller = videoControllers[postId];
     if (controller == null) {
-      final idx = posts.indexWhere((d) => d['id']?.toString() == postId);
-      if (idx != -1) _initializeVideoForIndex(idx);
-
-      if (thumbnailUrl != null && thumbnailUrl.isNotEmpty) {
-        return Center(
-          child: CachedNetworkImage(
-            imageUrl: thumbnailUrl,
-            fit: BoxFit.cover,
-            width: double.infinity,
-            height: double.infinity,
-            placeholder: (c, s) =>
-                const Center(child: CircularProgressIndicator()),
-            errorWidget: (c, s, e) =>
-                const Center(child: Icon(Icons.broken_image)),
-          ),
-        );
-      }
-      return const Center(child: Icon(Icons.broken_image));
+      final isFailed = _videoInitFailed.contains(postId);
+      return _buildVideoFallback(
+        thumbnailUrl: thumbnailUrl,
+        loading: !isFailed,
+        onRetry: isFailed ? () => _retryVideoInit(postId) : null,
+      );
     }
 
-    if (!controller.value.isInitialized) {
-      if (thumbnailUrl != null && thumbnailUrl.isNotEmpty) {
-        return Center(
-          child: CachedNetworkImage(
-            imageUrl: thumbnailUrl,
-            fit: BoxFit.cover,
-            width: double.infinity,
-            height: double.infinity,
-            placeholder: (c, s) =>
-                const Center(child: CircularProgressIndicator()),
-            errorWidget: (c, s, e) =>
-                const Center(child: Icon(Icons.broken_image)),
-          ),
-        );
-      }
-      return const Center(child: CircularProgressIndicator());
+    if (!controller.value.isInitialized || controller.value.hasError) {
+      return _buildVideoFallback(
+        thumbnailUrl: thumbnailUrl,
+        loading: !controller.value.hasError,
+        onRetry:
+            controller.value.hasError ? () => _retryVideoInit(postId) : null,
+      );
     }
 
     return FittedBox(
@@ -634,38 +787,70 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
     );
   }
 
+  Widget _buildVideoFallback({
+    required String? thumbnailUrl,
+    required bool loading,
+    VoidCallback? onRetry,
+  }) {
+    final bg = (thumbnailUrl != null && thumbnailUrl.isNotEmpty)
+        ? CachedNetworkImage(
+            imageUrl: thumbnailUrl,
+            fit: BoxFit.cover,
+            width: double.infinity,
+            height: double.infinity,
+            placeholder: (c, s) => const SizedBox.shrink(),
+            errorWidget: (c, s, e) =>
+                const Center(child: Icon(Icons.broken_image)),
+          )
+        : Container(color: Colors.black54);
+
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        bg,
+        if (loading)
+          const Center(
+            child: SizedBox(
+              width: 22,
+              height: 22,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            ),
+          ),
+        if (onRetry != null)
+          Center(
+            child: ElevatedButton.icon(
+              onPressed: onRetry,
+              icon: const Icon(Icons.refresh, size: 16),
+              label: const Text('Reessayer'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.black87,
+                foregroundColor: Colors.white,
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  void _retryVideoInit(String postId) {
+    final existing = videoControllers.remove(postId);
+    if (existing != null) {
+      try {
+        existing.pause();
+        existing.dispose();
+      } catch (_) {}
+    }
+    _videoInitFailed.remove(postId);
+    _videoRetryAfter.remove(postId);
+    _videoInitEpoch.remove(postId);
+    _videoInitInFlight.remove(postId);
+    final idx = posts.indexWhere((d) => d['id']?.toString() == postId);
+    if (idx != -1) {
+      _initializeVideoForIndex(idx);
+    }
+  }
+
   void _openComments(String postId) {
     openComments(context, postId);
-  }
-
-  void _openProduct(Map<String, dynamic> data) {
-    Navigator.pushNamed(context, '/product', arguments: data);
-  }
-
-  void _showDebugDialog(BuildContext ctx) {
-    showDialog(
-      context: ctx,
-      builder: (_) => AlertDialog(
-        title: const Text("Debug Posts Feed"),
-        content: SizedBox(
-          width: double.maxFinite,
-          child: ListView.builder(
-            itemCount: posts.length,
-            itemBuilder: (context, index) {
-              final d = posts[index];
-              return ListTile(
-                title: Text(d['description'] ?? 'Pas de description'),
-                subtitle: Text('@${d['seller_name'] ?? "?"} • id:${d['id']}'),
-                trailing: Text((d['is_video'] == true) ? 'Video' : 'Image'),
-              );
-            },
-          ),
-        ),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(ctx), child: const Text("Fermer"))
-        ],
-      ),
-    );
   }
 }

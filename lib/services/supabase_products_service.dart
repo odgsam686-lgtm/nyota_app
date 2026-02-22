@@ -102,6 +102,17 @@ class SupabaseProductsService {
     return List<Map<String, dynamic>>.from(res);
   }
 
+  Future<List<Map<String, dynamic>>> fetchAllProductsLite() async {
+    final res = await supabase
+        .from('posts')
+        .select(
+            'id, seller_id, media_url, media_type, is_video, video_variants, '
+            'thumbnail_url, thumbnail_path, description, created_at')
+        .order('created_at', ascending: false);
+
+    return List<Map<String, dynamic>>.from(res);
+  }
+
   // ==========================================
   // 🔥 CLASSIFICATION AUTOMATIQUE
   // ==========================================
@@ -183,7 +194,7 @@ class SupabaseProductsService {
   }) async {
     try {
       final query = supabase.from('posts').select(
-            'id, seller_id, seller_name, title, description, '
+            'id, seller_id, seller_name, description, '
             'media_url, media_type, thumbnail_url, '
             'category, price, currency, created_at, likes',
           );
@@ -202,19 +213,57 @@ class SupabaseProductsService {
     }
   }
 
+  Future<List<Map<String, dynamic>>> fetchProductsByCategoryLite({
+    required String category,
+    bool newestFirst = true,
+  }) async {
+    try {
+      final query = supabase.from('posts').select(
+            'id, seller_id, media_url, media_type, is_video, video_variants, '
+            'thumbnail_url, thumbnail_path, description, created_at',
+          );
+
+      if (category != 'all') {
+        query.eq('category', category);
+      }
+
+      query.order('created_at', ascending: !newestFirst);
+
+      final raw = await query;
+      return List<Map<String, dynamic>>.from(raw);
+    } catch (e) {
+      debugPrint("fetchProductsByCategoryLite error: $e");
+      return [];
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> fetchProductsMetaByIds(
+    List<String> ids,
+  ) async {
+    if (ids.isEmpty) return [];
+    try {
+      final raw = await supabase
+          .from('posts')
+          .select(
+              'id, seller_name, avatar_url, likes, comments_count, price, currency')
+          .inFilter('id', ids);
+      return List<Map<String, dynamic>>.from(raw);
+    } catch (e) {
+      debugPrint("fetchProductsMetaByIds error: $e");
+      return [];
+    }
+  }
+
   // ==========================================
   // 🔥 FETCH CATÉGORIES
   // ==========================================
   Future<List<Map<String, dynamic>>> fetchCategories() async {
     try {
       final raw = await supabase.from('categories').select('slug,label');
-
-      if (raw is List) {
-        return [
-          {'slug': 'all', 'label': 'Tous les produits'},
-          ...raw,
-        ];
-      }
+      return [
+        {'slug': 'all', 'label': 'Tous les produits'},
+        ...raw,
+      ];
     } catch (_) {}
 
     return [

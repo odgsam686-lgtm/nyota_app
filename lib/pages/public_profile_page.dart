@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:nyota_app/chat_screen.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
@@ -32,6 +34,8 @@ class _PublicProfilePageState extends State<PublicProfilePage> {
   int followingCount = 0;
 
   RealtimeChannel? followersChannel;
+  RealtimeChannel? postViewsChannel;
+  Timer? _postViewsRefreshDebounce;
   Stream<List<Map<String, dynamic>>> messagesStream(String conversationId) {
     final supabase = Supabase.instance.client;
 
@@ -48,6 +52,19 @@ class _PublicProfilePageState extends State<PublicProfilePage> {
     super.initState();
     loadProfile();
     initRealtimeFollowers();
+    initRealtimePostViews();
+  }
+
+  @override
+  void dispose() {
+    _postViewsRefreshDebounce?.cancel();
+    if (followersChannel != null) {
+      supabase.removeChannel(followersChannel!);
+    }
+    if (postViewsChannel != null) {
+      supabase.removeChannel(postViewsChannel!);
+    }
+    super.dispose();
   }
 
   Future<void> loadProfile() async {
@@ -85,8 +102,32 @@ class _PublicProfilePageState extends State<PublicProfilePage> {
           .eq('seller_id', widget.sellerId)
           .order('timestamp', ascending: false);
 
+      final postIds = postsRes
+          .map((p) => (p['id'] ?? '').toString())
+          .where((id) => id.isNotEmpty)
+          .toList();
+      final viewCounts = <String, int>{};
+      if (postIds.isNotEmpty) {
+        final views = await supabase
+            .from('post_views')
+            .select('post_id')
+            .inFilter('post_id', postIds);
+        for (final v in views) {
+          final pid = (v['post_id'] ?? '').toString();
+          if (pid.isEmpty) continue;
+          viewCounts[pid] = (viewCounts[pid] ?? 0) + 1;
+        }
+      }
+
+      final postsWithViews = postsRes.map((p) {
+        final row = Map<String, dynamic>.from(p);
+        final pid = (row['id'] ?? '').toString();
+        row['views_count'] = viewCounts[pid] ?? 0;
+        return row;
+      }).toList();
+
       setState(() {
-        posts = postsRes;
+        posts = postsWithViews;
       });
 
       /// =========================
@@ -174,6 +215,69 @@ class _PublicProfilePageState extends State<PublicProfilePage> {
           },
         )
         .subscribe();
+  }
+
+  void initRealtimePostViews() {
+    postViewsChannel = supabase.channel('post-views-${widget.sellerId}');
+    postViewsChannel!
+        .onPostgresChanges(
+          event: PostgresChangeEvent.all,
+          schema: 'public',
+          table: 'post_views',
+          callback: (payload) {
+            final postId = (payload.newRecord['post_id'] ??
+                    payload.oldRecord['post_id'] ??
+                    '')
+                .toString();
+            if (postId.isEmpty) return;
+            final hasInGrid = posts.any(
+              (p) => (p['id'] ?? '').toString() == postId,
+            );
+            if (!hasInGrid) return;
+            _scheduleRefreshPostViews();
+          },
+        )
+        .subscribe();
+  }
+
+  void _scheduleRefreshPostViews() {
+    _postViewsRefreshDebounce?.cancel();
+    _postViewsRefreshDebounce = Timer(
+      const Duration(milliseconds: 220),
+      _refreshPostViewsCounts,
+    );
+  }
+
+  Future<void> _refreshPostViewsCounts() async {
+    if (!mounted || posts.isEmpty) return;
+    final ids = posts
+        .map((p) => (p['id'] ?? '').toString())
+        .where((id) => id.isNotEmpty)
+        .toList();
+    if (ids.isEmpty) return;
+    try {
+      final rows = await supabase
+          .from('post_views')
+          .select('post_id')
+          .inFilter('post_id', ids);
+      if (!mounted) return;
+      final counts = <String, int>{};
+      for (final row in rows) {
+        final pid = (row['post_id'] ?? '').toString();
+        if (pid.isEmpty) continue;
+        counts[pid] = (counts[pid] ?? 0) + 1;
+      }
+      setState(() {
+        posts = posts.map((p) {
+          final row = Map<String, dynamic>.from(p);
+          final id = (row['id'] ?? '').toString();
+          row['views_count'] = counts[id] ?? 0;
+          return row;
+        }).toList();
+      });
+    } catch (e) {
+      debugPrint('public profile refresh views error: $e');
+    }
   }
 
   Future<String> getOrCreateConversation(String otherUserId) async {
@@ -521,7 +625,8 @@ class _PublicProfilePageState extends State<PublicProfilePage> {
                       final normalized = Map<String, dynamic>.from(post);
                       if (normalized['thumbnail_url'] == null &&
                           normalized['thumbnail_path'] != null) {
-                        normalized['thumbnail_url'] = normalized['thumbnail_path'];
+                        normalized['thumbnail_url'] =
+                            normalized['thumbnail_path'];
                       }
                       final postModel = PostModel.fromMap(normalized);
                       final thumbRaw = (normalized['thumbnail_url'] ??
@@ -541,6 +646,14 @@ class _PublicProfilePageState extends State<PublicProfilePage> {
                           normalized['durationSeconds'] ??
                           normalized['duration'];
                       final durationLabel = _formatDuration(durationSeconds);
+                      final dynamic rawViews = normalized['views_count'] ??
+                          normalized['viewsCount'] ??
+                          0;
+                      final int viewsCount = rawViews is int
+                          ? rawViews
+                          : (rawViews is num
+                              ? rawViews.toInt()
+                              : int.tryParse('$rawViews') ?? 0);
 
                       return GestureDetector(
                         onTap: () {
@@ -548,16 +661,14 @@ class _PublicProfilePageState extends State<PublicProfilePage> {
                             context,
                             MaterialPageRoute(
                               builder: (_) => MediaViewerPage(
-                                posts: posts
-                                    .map((e) {
-                                      final m = Map<String, dynamic>.from(e);
-                                      if (m['thumbnail_url'] == null &&
-                                          m['thumbnail_path'] != null) {
-                                        m['thumbnail_url'] = m['thumbnail_path'];
-                                      }
-                                      return PostModel.fromMap(m);
-                                    })
-                                    .toList(),
+                                posts: posts.map((e) {
+                                  final m = Map<String, dynamic>.from(e);
+                                  if (m['thumbnail_url'] == null &&
+                                      m['thumbnail_path'] != null) {
+                                    m['thumbnail_url'] = m['thumbnail_path'];
+                                  }
+                                  return PostModel.fromMap(m);
+                                }).toList(),
                                 initialIndex: index,
                                 allowDelete: false,
                               ),
@@ -609,7 +720,6 @@ class _PublicProfilePageState extends State<PublicProfilePage> {
                                         ),
                                       ),
                               ),
-
                               if (postModel.isVideo)
                                 const Positioned(
                                   bottom: 6,
@@ -620,7 +730,6 @@ class _PublicProfilePageState extends State<PublicProfilePage> {
                                     size: 20,
                                   ),
                                 ),
-
                               if (postModel.isVideo)
                                 Positioned(
                                   bottom: 6,
@@ -643,6 +752,38 @@ class _PublicProfilePageState extends State<PublicProfilePage> {
                                     ),
                                   ),
                                 ),
+                              Positioned(
+                                bottom: postModel.isVideo ? 26 : 6,
+                                left: 6,
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 6,
+                                    vertical: 2,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: Colors.black54,
+                                    borderRadius: BorderRadius.circular(4),
+                                  ),
+                                  child: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      const Icon(
+                                        Icons.remove_red_eye,
+                                        color: Colors.white,
+                                        size: 11,
+                                      ),
+                                      const SizedBox(width: 4),
+                                      Text(
+                                        '$viewsCount',
+                                        style: const TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 11,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
                             ],
                           ),
                         ),

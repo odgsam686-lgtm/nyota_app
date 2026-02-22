@@ -1,14 +1,12 @@
 import 'dart:async';
 
-import 'package:flutter/material.dart';
-import 'package:video_player/video_player.dart';
-import 'package:supabase_flutter/supabase_flutter.dart';
-import '../models/post_model.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import '../utils/storage_url.dart';
+import 'package:flutter/material.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:video_player/video_player.dart';
 
-bool _viewRegistered = false;
-Timer? _imageViewTimer;
+import '../models/post_model.dart';
+import '../utils/storage_url.dart';
 
 class MediaViewerPage extends StatefulWidget {
   final List<PostModel> posts;
@@ -27,36 +25,115 @@ class MediaViewerPage extends StatefulWidget {
 }
 
 class _MediaViewerPageState extends State<MediaViewerPage> {
+  static const Duration _viewThreshold = Duration(seconds: 2);
+
   late PageController _pageController;
   VideoPlayerController? _videoController;
   int currentIndex = 0;
   bool _deleting = false;
+
+  Timer? _imageViewTimer;
+  Timer? _videoViewTimer;
+  final Set<String> _viewRegisteredPostIds = {};
+  final Set<String> _viewInFlightPostIds = {};
 
   @override
   void initState() {
     super.initState();
     currentIndex = widget.initialIndex;
     _pageController = PageController(initialPage: currentIndex);
+    _startViewTracking(currentIndex);
     _loadVideoIfNeeded(currentIndex);
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      final post = widget.posts[currentIndex];
-
-      if (!post.isVideo) {
-        _imageViewTimer = Timer(const Duration(seconds: 2), () {
-          if (mounted && !_viewRegistered) {
-            _viewRegistered = true;
-            _registerView(post);
-          }
-        });
-      }
-    });
   }
 
   @override
   void dispose() {
+    _cancelViewTracking();
     _videoController?.dispose();
     _pageController.dispose();
     super.dispose();
+  }
+
+  void _cancelViewTracking() {
+    _imageViewTimer?.cancel();
+    _imageViewTimer = null;
+    _videoViewTimer?.cancel();
+    _videoViewTimer = null;
+  }
+
+  void _startViewTracking(int index) {
+    _cancelViewTracking();
+    if (index < 0 || index >= widget.posts.length) return;
+    final post = widget.posts[index];
+    if (post.isVideo) return;
+    if (_viewRegisteredPostIds.contains(post.id)) return;
+
+    _imageViewTimer = Timer(_viewThreshold, () async {
+      if (!mounted || currentIndex != index) return;
+      await _registerView(post.id);
+    });
+  }
+
+  void _scheduleVideoViewTracking(String postId) {
+    _videoViewTimer?.cancel();
+    if (_viewRegisteredPostIds.contains(postId)) return;
+
+    _videoViewTimer = Timer(_viewThreshold, () async {
+      if (!mounted) return;
+      if (currentIndex < 0 || currentIndex >= widget.posts.length) return;
+      final currentPost = widget.posts[currentIndex];
+      if (!currentPost.isVideo || currentPost.id != postId) return;
+      final controller = _videoController;
+      if (controller == null ||
+          !controller.value.isInitialized ||
+          !controller.value.isPlaying) {
+        return;
+      }
+      await _registerView(postId);
+    });
+  }
+
+  Future<void> _registerView(String postId) async {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid == null) return;
+    if (_viewRegisteredPostIds.contains(postId)) return;
+    if (_viewInFlightPostIds.contains(postId)) return;
+
+    _viewInFlightPostIds.add(postId);
+    bool success = false;
+    try {
+      try {
+        await Supabase.instance.client.from('post_views').upsert(
+          {
+            'post_id': postId,
+            'viewer_id': uid,
+          },
+          onConflict: 'post_id,viewer_id',
+        );
+        success = true;
+      } catch (_) {
+        final existing = await Supabase.instance.client
+            .from('post_views')
+            .select('id')
+            .eq('post_id', postId)
+            .eq('viewer_id', uid)
+            .limit(1);
+        if (existing.isEmpty) {
+          await Supabase.instance.client.from('post_views').insert({
+            'post_id': postId,
+            'viewer_id': uid,
+          });
+        }
+        success = true;
+      }
+    } catch (e) {
+      debugPrint('register view error post=$postId user=$uid error=$e');
+    } finally {
+      if (success) {
+        _viewRegisteredPostIds.add(postId);
+      }
+      _viewInFlightPostIds.remove(postId);
+    }
   }
 
   Future<void> _confirmDelete(PostModel post) async {
@@ -85,10 +162,7 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
 
     setState(() => _deleting = true);
     try {
-      await Supabase.instance.client
-          .from('posts')
-          .delete()
-          .eq('id', post.id);
+      await Supabase.instance.client.from('posts').delete().eq('id', post.id);
 
       if (!mounted) return;
       widget.posts.removeAt(currentIndex);
@@ -100,6 +174,7 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
         currentIndex = widget.posts.length - 1;
       }
       _pageController.jumpToPage(currentIndex);
+      _startViewTracking(currentIndex);
       _loadVideoIfNeeded(currentIndex);
       setState(() {});
     } catch (e) {
@@ -118,19 +193,17 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
     if (uid == null) return;
 
     final res = await Supabase.instance.client
-        .from('likes') // ✅ table correcte
+        .from('likes')
         .select('id')
         .eq('post_id', post.id)
         .eq('user_id', uid);
 
     if (res.isEmpty) {
-      // 👍 LIKE
       await Supabase.instance.client.from('likes').insert({
         'post_id': post.id,
         'user_id': uid,
       });
     } else {
-      // 💔 UNLIKE
       await Supabase.instance.client
           .from('likes')
           .delete()
@@ -138,38 +211,18 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
           .eq('user_id', uid);
     }
 
-    setState(() {}); // 🔄 refresh UI
+    setState(() {});
   }
 
-  Future<void> _registerView(PostModel post) async {
-    final uid = FirebaseAuth.instance.currentUser?.uid;
-    if (uid == null) return;
-
-    // Vérifie si l’utilisateur a déjà vu ce post
-    final res = await Supabase.instance.client
-        .from('post_views')
-        .select('id')
-        .eq('post_id', post.id)
-        .eq('viewer_id', uid);
-
-    if (res.isEmpty) {
-      await Supabase.instance.client.from('post_views').insert({
-        'post_id': post.id,
-        'viewer_id': uid,
-      });
-    }
-  }
-
-  // =======================
-  // 🎥 LOAD VIDEO AUTOPLAY
-  // =======================
   Future<void> _loadVideoIfNeeded(int index) async {
+    _videoViewTimer?.cancel();
     _videoController?.dispose();
     _videoController = null;
 
+    if (index < 0 || index >= widget.posts.length) return;
     final post = widget.posts[index];
     if (!post.isVideo) {
-      setState(() {});
+      if (mounted) setState(() {});
       return;
     }
 
@@ -177,26 +230,28 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
         ? post.mediaUrl
         : storagePublicUrl('posts', post.mediaUrl);
 
-    final controller = VideoPlayerController.networkUrl(Uri.parse(mediaUrl));
-    await controller.initialize();
-
-    controller
-      ..setLooping(true)
-      ..play();
-    controller.addListener(() {
-      if (_viewRegistered) return;
-
-      final value = controller.value;
-
-      if (value.isPlaying && value.position.inMilliseconds >= 2000) {
-        _viewRegistered = true;
-        _registerView(widget.posts[currentIndex]);
+    try {
+      final controller = VideoPlayerController.networkUrl(Uri.parse(mediaUrl));
+      await controller.initialize();
+      if (!mounted || currentIndex != index) {
+        await controller.dispose();
+        return;
       }
-    });
 
-    setState(() {
+      controller
+        ..setLooping(true)
+        ..play();
+
       _videoController = controller;
-    });
+      _scheduleVideoViewTracking(post.id);
+      setState(() {});
+    } catch (e) {
+      debugPrint('MediaViewer _loadVideoIfNeeded error post=${post.id}: $e');
+      if (!mounted) return;
+      setState(() {
+        _videoController = null;
+      });
+    }
   }
 
   @override
@@ -209,24 +264,8 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
         itemCount: widget.posts.length,
         onPageChanged: (index) {
           currentIndex = index;
-
-          // reset vue
-          _viewRegistered = false;
-          _imageViewTimer?.cancel();
-
+          _startViewTracking(index);
           _loadVideoIfNeeded(index);
-
-          final post = widget.posts[index];
-
-          // 🖼 IMAGE → vue après 2 secondes
-          if (!post.isVideo) {
-            _imageViewTimer = Timer(const Duration(seconds: 2), () {
-              if (mounted && !_viewRegistered) {
-                _viewRegistered = true;
-                _registerView(post);
-              }
-            });
-          }
         },
         itemBuilder: (context, index) {
           final post = widget.posts[index];
@@ -267,8 +306,6 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
                   ],
                 ),
               ),
-
-              // 🔙 RETOUR
               Positioned(
                 top: 40,
                 left: 16,
@@ -277,7 +314,6 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
                   onPressed: () => Navigator.pop(context),
                 ),
               ),
-
               if (widget.allowDelete &&
                   post.sellerId == FirebaseAuth.instance.currentUser?.uid)
                 Positioned(
@@ -297,8 +333,6 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
                     onPressed: _deleting ? null : () => _confirmDelete(post),
                   ),
                 ),
-
-              // ▶️ BARRE DE PROGRESSION
               if (post.isVideo && _videoController != null)
                 Positioned(
                   bottom: 20,
@@ -321,9 +355,6 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
     );
   }
 
-  // =======================
-  // 🎥 VIDEO WIDGET
-  // =======================
   Widget _buildVideo(PostModel post) {
     if (_videoController == null || !_videoController!.value.isInitialized) {
       final thumb = post.thumbnailUrl;
@@ -346,8 +377,10 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
       onTap: () {
         if (_videoController!.value.isPlaying) {
           _videoController!.pause();
+          _videoViewTimer?.cancel();
         } else {
           _videoController!.play();
+          _scheduleVideoViewTracking(post.id);
         }
         setState(() {});
       },
@@ -362,9 +395,6 @@ class _MediaViewerPageState extends State<MediaViewerPage> {
     );
   }
 
-  // =======================
-  // 🖼 IMAGE FULLSCREEN
-  // =======================
   Widget _buildImage(PostModel post) {
     final imageUrl = post.mediaUrl.startsWith('http')
         ? post.mediaUrl

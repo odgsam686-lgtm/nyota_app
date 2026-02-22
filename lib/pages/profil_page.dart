@@ -41,6 +41,8 @@ class _ProfilPageState extends State<ProfilPage> with RouteAware {
   final Set<String> _publishingDraftIds = {};
   bool _isOffline = false;
   late final StreamSubscription<ConnectivityResult> _connectivitySub;
+  RealtimeChannel? _postViewsChannel;
+  Timer? _postViewsRefreshDebounce;
   final Random _rand = Random();
 
   Map<String, dynamic>? userData;
@@ -80,6 +82,7 @@ class _ProfilPageState extends State<ProfilPage> with RouteAware {
     drafts = [];
 
     _initAndLoad(); // ✅ UN SEUL POINT D’ENTRÉE
+    _initPostViewsRealtime();
   }
 
   @override
@@ -106,6 +109,10 @@ class _ProfilPageState extends State<ProfilPage> with RouteAware {
 
   @override
   void dispose() {
+    _postViewsRefreshDebounce?.cancel();
+    if (_postViewsChannel != null) {
+      supabase.removeChannel(_postViewsChannel!);
+    }
     routeObserver.unsubscribe(this);
     _connectivitySub.cancel();
     super.dispose();
@@ -119,13 +126,80 @@ class _ProfilPageState extends State<ProfilPage> with RouteAware {
         _isOffline = result == ConnectivityResult.none;
       });
     });
-    _connectivitySub =
-        connectivity.onConnectivityChanged.listen((result) {
+    _connectivitySub = connectivity.onConnectivityChanged.listen((result) {
       if (!mounted) return;
       setState(() {
         _isOffline = result == ConnectivityResult.none;
       });
     });
+  }
+
+  void _initPostViewsRealtime() {
+    _postViewsChannel = supabase.channel('profile-post-views-$userId');
+    _postViewsChannel!
+        .onPostgresChanges(
+          event: PostgresChangeEvent.all,
+          schema: 'public',
+          table: 'post_views',
+          callback: (payload) {
+            final postId = (payload.newRecord['post_id'] ??
+                    payload.oldRecord['post_id'] ??
+                    '')
+                .toString();
+            if (postId.isEmpty) return;
+            if (!products.any((p) => p.id == postId)) return;
+            _scheduleRefreshPostViews();
+          },
+        )
+        .subscribe();
+  }
+
+  void _scheduleRefreshPostViews() {
+    _postViewsRefreshDebounce?.cancel();
+    _postViewsRefreshDebounce = Timer(
+      const Duration(milliseconds: 220),
+      _refreshPostViewsCounts,
+    );
+  }
+
+  Future<void> _refreshPostViewsCounts() async {
+    if (!mounted || products.isEmpty) return;
+    final ids = products.map((p) => p.id).toList();
+    if (ids.isEmpty) return;
+    try {
+      final rows = await supabase
+          .from('post_views')
+          .select('post_id')
+          .inFilter('post_id', ids);
+      if (!mounted) return;
+      final counts = <String, int>{};
+      for (final row in rows) {
+        final pid = (row['post_id'] ?? '').toString();
+        if (pid.isEmpty) continue;
+        counts[pid] = (counts[pid] ?? 0) + 1;
+      }
+      setState(() {
+        products = products
+            .map(
+              (p) => PostModel(
+                id: p.id,
+                sellerId: p.sellerId,
+                sellerName: p.sellerName,
+                mediaUrl: p.mediaUrl,
+                isVideo: p.isVideo,
+                description: p.description,
+                timestamp: p.timestamp,
+                likes: p.likes,
+                thumbnailUrl: p.thumbnailUrl,
+                likesCount: p.likesCount,
+                viewsCount: counts[p.id] ?? 0,
+              ),
+            )
+            .toList();
+      });
+    } catch (e) {
+      debugPrint('refresh post views error: $e');
+    }
   }
 
   Widget _statItem(String label, int value) {
@@ -149,41 +223,41 @@ class _ProfilPageState extends State<ProfilPage> with RouteAware {
   }
 
   Future<void> _initAndLoad() async {
-  // 1. Vérification de l'utilisateur
-  final fbUser = FirebaseAuth.instance.currentUser;
-  if (fbUser == null) {
-    if (mounted) {
-      setState(() => loading = false);
+    // 1. Vérification de l'utilisateur
+    final fbUser = FirebaseAuth.instance.currentUser;
+    if (fbUser == null) {
+      if (mounted) {
+        setState(() => loading = false);
+      }
+      return;
     }
-    return;
+
+    userId = fbUser.uid;
+
+    try {
+      // 2. Charger d'abord les données de base de l'utilisateur
+      await _loadUserData();
+
+      // Vérifier si l'écran est toujours affiché après la première requête réseau
+      if (!mounted) return;
+
+      // 3. Lancer les autres chargements EN PARALLÈLE pour gagner du temps
+      // On utilise Future.wait pour que l'app soit plus rapide
+      await Future.wait([
+        _loadPublications(),
+        _loadProfileStats(),
+        _loadDrafts(),
+      ]);
+    } catch (e) {
+      debugPrint("❌ Erreur lors de l'initialisation du profil: $e");
+    } finally {
+      // 4. Quoi qu'il arrive, on arrête le chargement si on est toujours sur la page
+      if (mounted) {
+        setState(() => loading = false);
+      }
+    }
   }
 
-  userId = fbUser.uid;
-
-  try {
-    // 2. Charger d'abord les données de base de l'utilisateur
-    await _loadUserData();
-
-    // Vérifier si l'écran est toujours affiché après la première requête réseau
-    if (!mounted) return;
-
-    // 3. Lancer les autres chargements EN PARALLÈLE pour gagner du temps
-    // On utilise Future.wait pour que l'app soit plus rapide
-    await Future.wait([
-      _loadPublications(),
-      _loadProfileStats(),
-      _loadDrafts(),
-    ]);
-
-  } catch (e) {
-    debugPrint("❌ Erreur lors de l'initialisation du profil: $e");
-  } finally {
-    // 4. Quoi qu'il arrive, on arrête le chargement si on est toujours sur la page
-    if (mounted) {
-      setState(() => loading = false);
-    }
-  }
-}
   // ===========================
   // Helper safe select - compatible SDK versions
   // ===========================
@@ -215,83 +289,82 @@ class _ProfilPageState extends State<ProfilPage> with RouteAware {
   // ===========================
   // Load user data from Supabase users table
   // ===========================
- Future<void> _loadUserData() async {
-  if (userId == null) return;
+  Future<void> _loadUserData() async {
+    if (userId == null) return;
 
-  try {
-    final rows = await _selectRows(
-      table: 'users',
-      columns: '*',
-      eqColumn: 'firebase_uid',
-      eqValue: userId!,
-    );
+    try {
+      final rows = await _selectRows(
+        table: 'users',
+        columns: '*',
+        eqColumn: 'firebase_uid',
+        eqValue: userId!,
+      );
 
-    // 1️⃣ SÉCURITÉ : On vérifie si l'utilisateur n'a pas quitté la page 
-    // pendant que Supabase répondait (évite le crash setState)
-    if (!mounted) return;
+      // 1️⃣ SÉCURITÉ : On vérifie si l'utilisateur n'a pas quitté la page
+      // pendant que Supabase répondait (évite le crash setState)
+      if (!mounted) return;
 
-    if (rows.isEmpty) {
-      userData = {
-        'firebase_uid': userId!,
-        'email': FirebaseAuth.instance.currentUser?.email,
-        'first_name': '',
-        'last_name': '',
-        'display_name': null,
-        'bio': null,
-        'photo_url': null,
-        'is_seller': false,
-      };
-    } else {
-      userData = Map<String, dynamic>.from(rows.first as Map);
+      if (rows.isEmpty) {
+        userData = {
+          'firebase_uid': userId!,
+          'email': FirebaseAuth.instance.currentUser?.email,
+          'first_name': '',
+          'last_name': '',
+          'display_name': null,
+          'bio': null,
+          'photo_url': null,
+          'is_seller': false,
+        };
+      } else {
+        userData = Map<String, dynamic>.from(rows.first as Map);
+      }
+
+      // Mise à jour des variables locales
+      isSeller = userData?['is_seller'] == true;
+
+      displayName = userData?['display_name'] ??
+          "${userData?['first_name'] ?? ''} ${userData?['last_name'] ?? ''}"
+              .trim();
+
+      if (displayName == null || displayName!.isEmpty) {
+        displayName = userData?['email'];
+      }
+
+      bio = userData?['bio'];
+
+      // 2️⃣ SÉCURITÉ : On vérifie encore mounted avant de rafraîchir l'écran
+      if (mounted) setState(() {});
+    } catch (e) {
+      debugPrint("❌ Erreur chargement user: $e");
+      // Optionnel : on peut forcer l'arrêt du chargement ici aussi
+      if (mounted) setState(() => loading = false);
+    }
+  }
+
+  Future<Map<String, dynamic>> _fetchUserProfile() async {
+    final firebaseUser = FirebaseAuth.instance.currentUser;
+    if (firebaseUser == null) {
+      throw Exception("Utilisateur non connecté");
     }
 
-    // Mise à jour des variables locales
-    isSeller = userData?['is_seller'] == true;
+    final user = await Supabase.instance.client
+        .from('users')
+        .select()
+        .eq('firebase_uid', firebaseUser.uid)
+        .single();
 
-    displayName = userData?['display_name'] ??
-        "${userData?['first_name'] ?? ''} ${userData?['last_name'] ?? ''}"
-            .trim();
+    final profile = await Supabase.instance.client
+        .from('public_profiles')
+        .select('username')
+        .eq('user_id', firebaseUser.uid)
+        .maybeSingle();
 
-    if (displayName == null || displayName!.isEmpty) {
-      displayName = userData?['email'];
+    if (profile != null && profile['username'] != null) {
+      user['username'] = profile['username'];
     }
 
-    bio = userData?['bio'];
-
-    // 2️⃣ SÉCURITÉ : On vérifie encore mounted avant de rafraîchir l'écran
-    if (mounted) setState(() {});
-    
-  } catch (e) {
-    debugPrint("❌ Erreur chargement user: $e");
-    // Optionnel : on peut forcer l'arrêt du chargement ici aussi
-    if (mounted) setState(() => loading = false);
+    return user;
   }
-}
-
-Future<Map<String, dynamic>> _fetchUserProfile() async {
-  final firebaseUser = FirebaseAuth.instance.currentUser;
-  if (firebaseUser == null) {
-    throw Exception("Utilisateur non connecté");
-  }
-
-  final user = await Supabase.instance.client
-      .from('users')
-      .select()
-      .eq('firebase_uid', firebaseUser.uid)
-      .single();
-
-  final profile = await Supabase.instance.client
-      .from('public_profiles')
-      .select('username')
-      .eq('user_id', firebaseUser.uid)
-      .maybeSingle();
-
-  if (profile != null && profile['username'] != null) {
-    user['username'] = profile['username'];
-  }
-
-  return user;
-}
 
   String _normalizeUsername(String input) {
     final lower = input.toLowerCase();
@@ -336,27 +409,29 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
     return '$root${DateTime.now().millisecondsSinceEpoch % 100000}';
   }
 
+  Future<String?> generateAndUploadThumbnail(
+      File videoFile, String postId) async {
+    // 1. Créer le fichier image dans le téléphone
+    final thumbnailPath = await VideoThumbnail.thumbnailFile(
+      video: videoFile.path,
+      imageFormat: ImageFormat.JPEG,
+      maxWidth: 400, // On limite la taille pour la grille
+      quality: 75,
+    );
 
-  Future<String?> generateAndUploadThumbnail(File videoFile, String postId) async {
-  // 1. Créer le fichier image dans le téléphone
-  final thumbnailPath = await VideoThumbnail.thumbnailFile(
-    video: videoFile.path,
-    imageFormat: ImageFormat.JPEG,
-    maxWidth: 400, // On limite la taille pour la grille
-    quality: 75,
-  );
+    if (thumbnailPath != null) {
+      File file = File(thumbnailPath);
+      // 2. Upload sur Supabase dans un dossier /thumbnails
+      final fileName = 'thumb_$postId.jpg';
+      await supabase.storage
+          .from('posts_media')
+          .upload('thumbnails/$fileName', file);
 
-  if (thumbnailPath != null) {
-    File file = File(thumbnailPath);
-    // 2. Upload sur Supabase dans un dossier /thumbnails
-    final fileName = 'thumb_$postId.jpg';
-    await supabase.storage.from('posts_media').upload('thumbnails/$fileName', file);
-    
-    // 3. Récupérer l'URL
-    return storagePublicUrl('posts_media', 'thumbnails/$fileName');
+      // 3. Récupérer l'URL
+      return storagePublicUrl('posts_media', 'thumbnails/$fileName');
+    }
+    return null;
   }
-  return null;
-}
 
   Future<void> _loadProfileStats() async {
     if (userId == null) return;
@@ -400,8 +475,27 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
         debugPrint("➡️ POST seller_id = ${r['seller_id']}");
       }
 
+      final postIds = rows
+          .map((r) => (r['id'] ?? '').toString())
+          .where((id) => id.isNotEmpty)
+          .toList();
+      final viewCounts = <String, int>{};
+      if (postIds.isNotEmpty) {
+        final views = await supabase
+            .from('post_views')
+            .select('post_id')
+            .inFilter('post_id', postIds);
+        for (final v in views) {
+          final pid = (v['post_id'] ?? '').toString();
+          if (pid.isEmpty) continue;
+          viewCounts[pid] = (viewCounts[pid] ?? 0) + 1;
+        }
+      }
+
       products = rows.map<PostModel>((r) {
         final row = Map<String, dynamic>.from(r as Map);
+        final pid = (row['id'] ?? '').toString();
+        row['views_count'] = viewCounts[pid] ?? 0;
         return _rowToPostModel(row);
       }).toList();
 
@@ -415,7 +509,7 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
   // ===========================
   // Load drafts
   // ===========================
- Future<void> _loadDrafts() async {
+  Future<void> _loadDrafts() async {
     final store = DraftLocalStore();
     localDrafts = store.getByStates([
       DraftState.localOnly,
@@ -425,6 +519,7 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
     ]);
     if (mounted) setState(() {});
   }
+
   // ===========================
   // Pick & upload avatar to Supabase storage
   // ===========================
@@ -497,8 +592,7 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
 
       // ✅ UI refresh immédiat (cache-bust)
       if (!mounted) return;
-      final newUrl =
-          "$avatarUrl?v=${DateTime.now().millisecondsSinceEpoch}";
+      final newUrl = "$avatarUrl?v=${DateTime.now().millisecondsSinceEpoch}";
 
       if (mounted) {
         setState(() {
@@ -517,10 +611,10 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
             .eq('user_id', userId!)
             .maybeSingle();
         final existingUsername = profile?['username']?.toString().trim();
-        final usernameToSave = (existingUsername == null ||
-                existingUsername.isEmpty)
-            ? await _generateUniqueUsername(displayName ?? userId!, userId!)
-            : existingUsername;
+        final usernameToSave =
+            (existingUsername == null || existingUsername.isEmpty)
+                ? await _generateUniqueUsername(displayName ?? userId!, userId!)
+                : existingUsername;
 
         await supabase.from('public_profiles').upsert({
           'user_id': userId!,
@@ -679,10 +773,10 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
             .eq('user_id', userId!)
             .maybeSingle();
         final existingUsername = profile?['username']?.toString().trim();
-        final usernameToSave = (existingUsername == null ||
-                existingUsername.isEmpty)
-            ? await _generateUniqueUsername(displayName ?? userId!, userId!)
-            : existingUsername;
+        final usernameToSave =
+            (existingUsername == null || existingUsername.isEmpty)
+                ? await _generateUniqueUsername(displayName ?? userId!, userId!)
+                : existingUsername;
 
         await supabase.from('public_profiles').upsert({
           'user_id': userId!,
@@ -830,11 +924,12 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
                                   .maybeSingle();
                               final existingUsername =
                                   profile?['username']?.toString().trim();
-                              final usernameToSave = (existingUsername == null ||
-                                      existingUsername.isEmpty)
-                                  ? await _generateUniqueUsername(
-                                      value, userId!)
-                                  : existingUsername;
+                              final usernameToSave =
+                                  (existingUsername == null ||
+                                          existingUsername.isEmpty)
+                                      ? await _generateUniqueUsername(
+                                          value, userId!)
+                                      : existingUsername;
 
                               await supabase.from('public_profiles').upsert({
                                 'user_id': userId!,
@@ -943,11 +1038,12 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
                                   .maybeSingle();
                               final existingUsername =
                                   profile?['username']?.toString().trim();
-                              final usernameToSave = (existingUsername == null ||
-                                      existingUsername.isEmpty)
-                                  ? await _generateUniqueUsername(
-                                      displayName ?? userId!, userId!)
-                                  : existingUsername;
+                              final usernameToSave =
+                                  (existingUsername == null ||
+                                          existingUsername.isEmpty)
+                                      ? await _generateUniqueUsername(
+                                          displayName ?? userId!, userId!)
+                                      : existingUsername;
 
                               await supabase.from('public_profiles').upsert({
                                 'user_id': userId!,
@@ -1074,7 +1170,8 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
 
     showDialog(
       context: context,
-      barrierDismissible: false, // Empêche de fermer en cliquant à côté pendant l'opération
+      barrierDismissible:
+          false, // Empêche de fermer en cliquant à côté pendant l'opération
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setStateDialog) {
           // La condition pour activer le bouton
@@ -1094,13 +1191,16 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
                       style: TextStyle(fontSize: 13, color: Colors.grey)),
                   TextField(
                       controller: shopCtrl,
-                      onChanged: (_) => setStateDialog(() {}), // Force la vérification du bouton
-                      decoration: const InputDecoration(labelText: "Nom de boutique *")),
+                      onChanged: (_) => setStateDialog(
+                          () {}), // Force la vérification du bouton
+                      decoration: const InputDecoration(
+                          labelText: "Nom de boutique *")),
                   TextField(
                       controller: phoneCtrl,
                       onChanged: (_) => setStateDialog(() {}),
                       keyboardType: TextInputType.phone,
-                      decoration: const InputDecoration(labelText: "Téléphone *")),
+                      decoration:
+                          const InputDecoration(labelText: "Téléphone *")),
                   TextField(
                       controller: emailCtrl,
                       enabled: false,
@@ -1109,7 +1209,8 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
                   TextField(
                       controller: addressCtrl,
                       onChanged: (_) => setStateDialog(() {}),
-                      decoration: const InputDecoration(labelText: "Localisation *")),
+                      decoration:
+                          const InputDecoration(labelText: "Localisation *")),
                   const SizedBox(height: 10),
                   Row(
                     children: [
@@ -1130,10 +1231,12 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
             actions: [
               TextButton(
                   onPressed: () => Navigator.pop(ctx),
-                  child: const Text("Annuler", style: TextStyle(color: Colors.red))),
+                  child: const Text("Annuler",
+                      style: TextStyle(color: Colors.red))),
               ElevatedButton(
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: isFormValid ? Colors.deepPurple : Colors.grey,
+                  backgroundColor:
+                      isFormValid ? Colors.deepPurple : Colors.grey,
                   foregroundColor: Colors.white,
                 ),
                 onPressed: isFormValid
@@ -1148,14 +1251,12 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
                           }).eq('firebase_uid', userId!);
 
                           // 2️⃣ Mise à jour table 'public_profiles'
-                          await supabase
-                              .from('public_profiles')
-                              .update({'is_seller': true})
-                              .eq('user_id', userId!);
+                          await supabase.from('public_profiles').update(
+                              {'is_seller': true}).eq('user_id', userId!);
 
                           // 3️⃣ Recharger les données et l'UI
                           await _loadUserData();
-                          
+
                           if (!mounted) return;
 
                           // 4️⃣ Fermer le dialogue
@@ -1164,7 +1265,8 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
                           }
 
                           ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(content: Text("Profil vendeur activé !")),
+                            const SnackBar(
+                                content: Text("Profil vendeur activé !")),
                           );
                         } catch (e) {
                           debugPrint("❌ Erreur activation vendeur: $e");
@@ -1211,13 +1313,19 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
   // ===========================
   PostModel _rowToPostModel(Map<String, dynamic> row, {bool isDraft = false}) {
     final id = row['id']?.toString() ?? '';
-    final sellerId = isDraft ? (row['user_id']?.toString() ?? '') : (row['seller_id']?.toString() ?? '');
+    final sellerId = isDraft
+        ? (row['user_id']?.toString() ?? '')
+        : (row['seller_id']?.toString() ?? '');
     final sellerName = row['seller_name']?.toString() ?? '';
     final mediaUrl = row['media_url']?.toString();
     final isVideo = row['is_video'] == true;
     final description = row['description']?.toString() ?? '';
     final createdAt = _parseDateTime(row['created_at']);
     final thumb = row['thumbnail_path'] ?? row['thumbnail_url'];
+    final dynamic rawViews = row['views_count'] ?? row['viewsCount'] ?? 0;
+    final int viewsCount = rawViews is int
+        ? rawViews
+        : (rawViews is num ? rawViews.toInt() : int.tryParse('$rawViews') ?? 0);
 
     return PostModel(
       id: id,
@@ -1229,13 +1337,19 @@ Future<Map<String, dynamic>> _fetchUserProfile() async {
       description: description,
       timestamp: createdAt,
       likes: row['likes'] ?? 0,
+      viewsCount: viewsCount,
     );
   }
-Future<void> _publishFromDraft(PostModel draft) async {
+
+  Future<void> _publishFromDraft(PostModel draft) async {
     setState(() => loading = true);
     try {
       // 1. Récupérer le profil pour avoir les infos à jour
-      final profile = await supabase.from('public_profiles').select().eq('user_id', userId!).maybeSingle();
+      final profile = await supabase
+          .from('public_profiles')
+          .select()
+          .eq('user_id', userId!)
+          .maybeSingle();
 
       // 2. Insérer dans 'posts'
       await supabase.from('posts').insert({
@@ -1244,7 +1358,8 @@ Future<void> _publishFromDraft(PostModel draft) async {
         'username': profile?['username'],
         'avatar_url': profile?['avatar_url'],
         'media_url': draft.mediaUrl,
-        'thumbnail_url': draft.thumbnailUrl, // ✅ On récupère la miniature du brouillon
+        'thumbnail_url':
+            draft.thumbnailUrl, // ✅ On récupère la miniature du brouillon
         'is_video': draft.isVideo,
         'description': draft.description,
         'created_at': DateTime.now().toIso8601String(),
@@ -1254,7 +1369,8 @@ Future<void> _publishFromDraft(PostModel draft) async {
       // 3. Supprimer le brouillon
       await supabase.from('drafts').delete().eq('id', draft.id);
 
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Publié avec succès !")));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text("Publié avec succès !")));
       _loadDrafts();
       _loadPublications();
     } catch (e) {
@@ -1263,372 +1379,373 @@ Future<void> _publishFromDraft(PostModel draft) async {
       setState(() => loading = false);
     }
   }
+
   // ===========================
   // UI
   // ===========================
- @override
-Widget build(BuildContext context) {
-  return FutureBuilder<Map<String, dynamic>>(
-    future: _fetchUserProfile(),
-    builder: (context, snapshot) {
-      if (!snapshot.hasData) {
-        return const Scaffold(
-          body: Center(child: CircularProgressIndicator()),
-        );
-      }
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<Map<String, dynamic>>(
+      future: _fetchUserProfile(),
+      builder: (context, snapshot) {
+        if (!snapshot.hasData) {
+          return const Scaffold(
+            body: Center(child: CircularProgressIndicator()),
+          );
+        }
 
-      final userData = snapshot.data!;
-      final bool isSeller = userData['is_seller'] == true;
+        final userData = snapshot.data!;
+        final bool isSeller = userData['is_seller'] == true;
 
-      return Scaffold(
-        appBar: AppBar(
-          toolbarHeight: 44,
-          actions: [
-            const PrivateProfileMenu(),
-          ],
-        ),
-        body: ListView(
-          padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
-          children: [
-            /// 🔹 AVATAR
-            Center(
-              child: Stack(
-                children: [
-                  GestureDetector(
-                    onTap: () {
-                      final photoUrl =
-                          _avatarUrlUI ?? userData['photo_url'];
-                      Navigator.push(
-                        context,
-                        MaterialPageRoute(
-                          builder: (_) => AvatarFullScreenPage(
-                            photoUrl: photoUrl,
-                            onDelete: _deleteAvatar,
+        return Scaffold(
+          appBar: AppBar(
+            toolbarHeight: 44,
+            actions: [
+              const PrivateProfileMenu(),
+            ],
+          ),
+          body: ListView(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+            children: [
+              /// 🔹 AVATAR
+              Center(
+                child: Stack(
+                  children: [
+                    GestureDetector(
+                      onTap: () {
+                        final photoUrl = _avatarUrlUI ?? userData['photo_url'];
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) => AvatarFullScreenPage(
+                              photoUrl: photoUrl,
+                              onDelete: _deleteAvatar,
+                            ),
+                          ),
+                        );
+                      },
+                      child: CircleAvatar(
+                        radius: 55,
+                        backgroundImage: (userData['photo_url'] != null)
+                            ? NetworkImage(
+                                _avatarUrlUI ?? userData['photo_url'],
+                              )
+                            : const AssetImage("assets/images/avatar.png")
+                                as ImageProvider,
+                      ),
+                    ),
+                    Positioned(
+                      bottom: 0,
+                      right: 0,
+                      child: GestureDetector(
+                        onTap: _showAvatarOptionsSheet,
+                        child: Container(
+                          width: 28,
+                          height: 28,
+                          decoration: BoxDecoration(
+                            color: Colors.black,
+                            shape: BoxShape.circle,
+                            border: Border.all(color: Colors.white, width: 2),
+                          ),
+                          child: const Icon(
+                            Icons.add,
+                            color: Colors.white,
+                            size: 16,
                           ),
                         ),
-                      );
-                    },
-                    child: CircleAvatar(
-                      radius: 55,
-                      backgroundImage: (userData['photo_url'] != null)
-                          ? NetworkImage(
-                              _avatarUrlUI ?? userData['photo_url'],
-                            )
-                          : const AssetImage("assets/images/avatar.png")
-                              as ImageProvider,
-                    ),
-                  ),
-                  Positioned(
-                    bottom: 0,
-                    right: 0,
-                    child: GestureDetector(
-                      onTap: _showAvatarOptionsSheet,
-                      child: Container(
-                        width: 28,
-                        height: 28,
-                        decoration: BoxDecoration(
-                          color: Colors.black,
-                          shape: BoxShape.circle,
-                          border: Border.all(color: Colors.white, width: 2),
-                        ),
-                        child: const Icon(
-                          Icons.add,
-                          color: Colors.white,
-                          size: 16,
-                        ),
                       ),
                     ),
-                  ),
-                ],
-              ),
-            ),
-
-            const SizedBox(height: 12),
-
-            /// 🔹 NOM (capsule)
-            Center(
-              child: GestureDetector(
-                onTap: _editDisplayName,
-                child: Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                  decoration: BoxDecoration(
-                    color: Colors.black.withOpacity(0.05),
-                    borderRadius: BorderRadius.circular(999),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Text(
-                        () {
-                          final display =
-                              (userData['display_name'] as String?)?.trim();
-                          if (display != null && display.isNotEmpty) {
-                            return display;
-                          }
-                          return "+ Ajouter un nom";
-                        }(),
-                        style: TextStyle(
-                          fontSize: 15,
-                          fontWeight: FontWeight.w600,
-                          color: (userData['display_name'] as String?)
-                                      ?.trim()
-                                      .isNotEmpty ==
-                                  true
-                              ? Colors.black
-                              : Colors.black54,
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      const Icon(Icons.chevron_right,
-                          size: 18, color: Colors.black54),
-                      const SizedBox(width: 2),
-                      const Icon(Icons.edit,
-                          size: 16, color: Colors.black54),
-                    ],
-                  ),
+                  ],
                 ),
               ),
-            ),
 
-            const SizedBox(height: 6),
+              const SizedBox(height: 12),
 
-            /// 🔹 EMAIL (petit gris)
-            Center(
-              child: Text(
-                userData['email'] ?? "",
-                style: const TextStyle(
-                  fontSize: 12,
-                  color: Colors.black54,
-                ),
-              ),
-            ),
-
-            const SizedBox(height: 6),
-
-            /// 🔹 BIO (capsule)
-            Center(
-              child: GestureDetector(
-                onTap: _editBio,
-                child: Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                  decoration: BoxDecoration(
-                    color: Colors.black.withOpacity(0.05),
-                    borderRadius: BorderRadius.circular(999),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Flexible(
-                        child: Text(
+              /// 🔹 NOM (capsule)
+              Center(
+                child: GestureDetector(
+                  onTap: _editDisplayName,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 14, vertical: 10),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withOpacity(0.05),
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
                           () {
-                            final bioText =
-                                (userData['bio'] as String?)?.trim() ?? "";
-                            if (bioText.isNotEmpty) {
-                              return bioText;
+                            final display =
+                                (userData['display_name'] as String?)?.trim();
+                            if (display != null && display.isNotEmpty) {
+                              return display;
                             }
-                            return "+ Ajouter une bio ·  Mon activité est…";
+                            return "+ Ajouter un nom";
                           }(),
-                          textAlign: TextAlign.center,
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
                           style: TextStyle(
-                            fontSize: 13,
-                            color: (userData['bio'] as String?)
+                            fontSize: 15,
+                            fontWeight: FontWeight.w600,
+                            color: (userData['display_name'] as String?)
                                         ?.trim()
                                         .isNotEmpty ==
                                     true
-                                ? Colors.black87
+                                ? Colors.black
                                 : Colors.black54,
                           ),
                         ),
-                      ),
-                      const SizedBox(width: 8),
-                      GestureDetector(
-                        onTap: _editBio,
-                        child: const Icon(
-                          Icons.edit,
-                          size: 16,
-                          color: Colors.black54,
-                        ),
-                      ),
-                    ],
+                        const SizedBox(width: 8),
+                        const Icon(Icons.chevron_right,
+                            size: 18, color: Colors.black54),
+                        const SizedBox(width: 2),
+                        const Icon(Icons.edit, size: 16, color: Colors.black54),
+                      ],
+                    ),
                   ),
                 ),
               ),
-            ),
 
-            const SizedBox(height: 20),
+              const SizedBox(height: 6),
 
-            /// 🔹 STATS
-            Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                _stat("Abonnés", followersCount),
-                const SizedBox(width: 30),
-                _stat("Suivis", followingCount),
-                const SizedBox(width: 30),
-                _stat("Vues", creatorViews),
-                const SizedBox(width: 30),
-                _stat("Likes", creatorLikes),
-              ],
-            ),
-
-            const SizedBox(height: 20),
-
-            /// 🔥 LE POINT CLÉ
-            if (!isSeller)
-              ElevatedButton.icon(
-                icon: const Icon(Icons.store),
-                label: const Text("Activer Vendre"),
-                onPressed: _activateSellerFlow,
-              )
-            else
-              _sellerPanel(),
-
-            if (false) ...[
-              const SizedBox(height: 20),
-              const Text(
-                "Brouillons",
-                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+              /// 🔹 EMAIL (petit gris)
+              Center(
+                child: Text(
+                  userData['email'] ?? "",
+                  style: const TextStyle(
+                    fontSize: 12,
+                    color: Colors.black54,
+                  ),
+                ),
               ),
-              const SizedBox(height: 8),
-              ...localDrafts.map((d) {
-                final typeLabel = d.isVideo ? "Vidéo" : "Image";
-                final created = d.createdAt;
-                final createdText =
-                    "${created.day}/${created.month}/${created.year}";
-                final hasLocalThumb =
-                    d.isVideo && d.thumbnailLocalPath != null;
-                final stateName = d.state.name;
-                final isUploading = stateName == "uploading";
-                final isPublished = stateName == "published";
-                final isFailed = stateName == "failed";
-                final isQueued = stateName == "queued";
-                final canPublish = !isUploading && !isPublished;
-                final errorText =
-                    (isFailed && (d.errorMessage?.isNotEmpty ?? false))
-                        ? "Erreur: ${d.errorMessage}"
-                        : null;
-                return Card(
-                  child: ListTile(
-                    leading: hasLocalThumb
-                        ? Image.file(
-                            File(d.thumbnailLocalPath!),
-                            width: 56,
-                            height: 56,
-                            fit: BoxFit.cover,
-                          )
-                        : Icon(d.isVideo ? Icons.videocam : Icons.image),
-                    title: Text(
-                      d.description.isNotEmpty ? d.description : "Sans description",
+
+              const SizedBox(height: 6),
+
+              /// 🔹 BIO (capsule)
+              Center(
+                child: GestureDetector(
+                  onTap: _editBio,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 14, vertical: 10),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withOpacity(0.05),
+                      borderRadius: BorderRadius.circular(999),
                     ),
-                    subtitle: Text(
-                      errorText == null
-                          ? "$typeLabel • $createdText"
-                          : "$typeLabel • $createdText\n$errorText",
-                    ),
-                    trailing: Row(
+                    child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        _buildDraftStateBadge(
-                          stateName: stateName,
-                          isUploading: isUploading,
-                          isFailed: isFailed,
-                          isPublished: isPublished,
-                          isQueued: isQueued,
+                        Flexible(
+                          child: Text(
+                            () {
+                              final bioText =
+                                  (userData['bio'] as String?)?.trim() ?? "";
+                              if (bioText.isNotEmpty) {
+                                return bioText;
+                              }
+                              return "+ Ajouter une bio ·  Mon activité est…";
+                            }(),
+                            textAlign: TextAlign.center,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 13,
+                              color: (userData['bio'] as String?)
+                                          ?.trim()
+                                          .isNotEmpty ==
+                                      true
+                                  ? Colors.black87
+                                  : Colors.black54,
+                            ),
+                          ),
                         ),
                         const SizedBox(width: 8),
-                        TextButton(
-                          onPressed: (!canPublish ||
-                                  _publishingDraftIds.contains(d.id))
-                              ? null
-                              : () async {
-                                  if (_isOffline) {
-                                    ScaffoldMessenger.of(context).showSnackBar(
-                                      const SnackBar(
-                                        content: Text(
-                                          "Publication en attente de connexion",
-                                        ),
-                                      ),
-                                    );
-                                    return;
-                                  }
-                                  setState(() {
-                                    _publishingDraftIds.add(d.id);
-                                  });
-                                  try {
-                                    final result =
-                                        await DraftOfflineManager.publishDraft(
-                                            draft: d);
-                                    if (result.success) {
-                                      if (mounted) setState(() {});
-                                    } else if (mounted) {
-                                      ScaffoldMessenger.of(context).showSnackBar(
-                                        SnackBar(
-                                          content: Text(
-                                            result.errorMessage ??
-                                                "Échec publication",
-                                          ),
-                                        ),
-                                      );
-                                    }
-                                  } finally {
-                                    if (mounted) {
-                                      setState(() {
-                                        _publishingDraftIds.remove(d.id);
-                                      });
-                                    }
-                                  }
-                                },
-                          child: _publishingDraftIds.contains(d.id) ||
-                                  isUploading
-                              ? const Text("Envoi...")
-                              : Text(
-                                  _isOffline
-                                      ? "Mettre en file"
-                                      : (isFailed ? "Réessayer" : "Publier"),
-                                ),
+                        GestureDetector(
+                          onTap: _editBio,
+                          child: const Icon(
+                            Icons.edit,
+                            size: 16,
+                            color: Colors.black54,
+                          ),
                         ),
                       ],
                     ),
-                    onLongPress: () async {
-                      final confirm = await showDialog<bool>(
-                        context: context,
-                        builder: (_) => AlertDialog(
-                          title: const Text("Supprimer ce brouillon ?"),
-                          actions: [
-                            TextButton(
-                              onPressed: () => Navigator.pop(context, false),
-                              child: const Text("Annuler"),
-                            ),
-                            ElevatedButton(
-                              onPressed: () => Navigator.pop(context, true),
-                              child: const Text("Supprimer"),
-                            ),
-                          ],
-                        ),
-                      );
-
-                      if (confirm == true) {
-                        DraftLocalStore().deleteWithFiles(d);
-                        if (mounted) setState(() {});
-                      }
-                    },
                   ),
-                );
-              }).toList(),
+                ),
+              ),
+
+              const SizedBox(height: 20),
+
+              /// 🔹 STATS
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  _stat("Abonnés", followersCount),
+                  const SizedBox(width: 30),
+                  _stat("Suivis", followingCount),
+                  const SizedBox(width: 30),
+                  _stat("Vues", creatorViews),
+                  const SizedBox(width: 30),
+                  _stat("Likes", creatorLikes),
+                ],
+              ),
+
+              const SizedBox(height: 20),
+
+              /// 🔥 LE POINT CLÉ
+              if (!isSeller)
+                ElevatedButton.icon(
+                  icon: const Icon(Icons.store),
+                  label: const Text("Activer Vendre"),
+                  onPressed: _activateSellerFlow,
+                )
+              else
+                _sellerPanel(),
+
+              if (false) ...[
+                const SizedBox(height: 20),
+                const Text(
+                  "Brouillons",
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 8),
+                ...localDrafts.map((d) {
+                  final typeLabel = d.isVideo ? "Vidéo" : "Image";
+                  final created = d.createdAt;
+                  final createdText =
+                      "${created.day}/${created.month}/${created.year}";
+                  final hasLocalThumb =
+                      d.isVideo && d.thumbnailLocalPath != null;
+                  final stateName = d.state.name;
+                  final isUploading = stateName == "uploading";
+                  final isPublished = stateName == "published";
+                  final isFailed = stateName == "failed";
+                  final isQueued = stateName == "queued";
+                  final canPublish = !isUploading && !isPublished;
+                  final errorText =
+                      (isFailed && (d.errorMessage?.isNotEmpty ?? false))
+                          ? "Erreur: ${d.errorMessage}"
+                          : null;
+                  return Card(
+                    child: ListTile(
+                      leading: hasLocalThumb
+                          ? Image.file(
+                              File(d.thumbnailLocalPath!),
+                              width: 56,
+                              height: 56,
+                              fit: BoxFit.cover,
+                            )
+                          : Icon(d.isVideo ? Icons.videocam : Icons.image),
+                      title: Text(
+                        d.description.isNotEmpty
+                            ? d.description
+                            : "Sans description",
+                      ),
+                      subtitle: Text(
+                        errorText == null
+                            ? "$typeLabel • $createdText"
+                            : "$typeLabel • $createdText\n$errorText",
+                      ),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          _buildDraftStateBadge(
+                            stateName: stateName,
+                            isUploading: isUploading,
+                            isFailed: isFailed,
+                            isPublished: isPublished,
+                            isQueued: isQueued,
+                          ),
+                          const SizedBox(width: 8),
+                          TextButton(
+                            onPressed: (!canPublish ||
+                                    _publishingDraftIds.contains(d.id))
+                                ? null
+                                : () async {
+                                    if (_isOffline) {
+                                      ScaffoldMessenger.of(context)
+                                          .showSnackBar(
+                                        const SnackBar(
+                                          content: Text(
+                                            "Publication en attente de connexion",
+                                          ),
+                                        ),
+                                      );
+                                      return;
+                                    }
+                                    setState(() {
+                                      _publishingDraftIds.add(d.id);
+                                    });
+                                    try {
+                                      final result = await DraftOfflineManager
+                                          .publishDraft(draft: d);
+                                      if (result.success) {
+                                        if (mounted) setState(() {});
+                                      } else if (mounted) {
+                                        ScaffoldMessenger.of(context)
+                                            .showSnackBar(
+                                          SnackBar(
+                                            content: Text(
+                                              result.errorMessage ??
+                                                  "Échec publication",
+                                            ),
+                                          ),
+                                        );
+                                      }
+                                    } finally {
+                                      if (mounted) {
+                                        setState(() {
+                                          _publishingDraftIds.remove(d.id);
+                                        });
+                                      }
+                                    }
+                                  },
+                            child: _publishingDraftIds.contains(d.id) ||
+                                    isUploading
+                                ? const Text("Envoi...")
+                                : Text(
+                                    _isOffline
+                                        ? "Mettre en file"
+                                        : (isFailed ? "Réessayer" : "Publier"),
+                                  ),
+                          ),
+                        ],
+                      ),
+                      onLongPress: () async {
+                        final confirm = await showDialog<bool>(
+                          context: context,
+                          builder: (_) => AlertDialog(
+                            title: const Text("Supprimer ce brouillon ?"),
+                            actions: [
+                              TextButton(
+                                onPressed: () => Navigator.pop(context, false),
+                                child: const Text("Annuler"),
+                              ),
+                              ElevatedButton(
+                                onPressed: () => Navigator.pop(context, true),
+                                child: const Text("Supprimer"),
+                              ),
+                            ],
+                          ),
+                        );
+
+                        if (confirm == true) {
+                          DraftLocalStore().deleteWithFiles(d);
+                          if (mounted) setState(() {});
+                        }
+                      },
+                    ),
+                  );
+                }).toList(),
+              ],
+
+              const SizedBox(height: 40),
             ],
-
-            const SizedBox(height: 40),
-          ],
-        ),
-      );
-    },
-  );
-}
-
+          ),
+        );
+      },
+    );
+  }
 
   Widget _stat(String title, int value) {
     return Column(children: [
@@ -1705,81 +1822,112 @@ Widget build(BuildContext context) {
     );
   }
 
- Widget _buildPublicationsList(BuildContext context) {
-  if (products.isEmpty) {
-    return const Center(child: Text("Aucune publication"));
-  }
+  Widget _buildPublicationsList(BuildContext context) {
+    if (products.isEmpty) {
+      return const Center(child: Text("Aucune publication"));
+    }
 
-  return GridView.builder(
-    padding: const EdgeInsets.all(6),
-    gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-      crossAxisCount: 3,
-      crossAxisSpacing: 6,
-      mainAxisSpacing: 6,
-      childAspectRatio: 1,
-    ),
-    itemCount: products.length,
-    itemBuilder: (context, i) {
-      final p = products[i];
-      final String displayUrl = p.isVideo
-          ? ((p.thumbnailUrl != null && p.thumbnailUrl!.isNotEmpty)
-              ? resolveMediaUrl(p.thumbnailUrl!)
-              : resolveMediaUrl(p.mediaUrl))
-          : resolveMediaUrl(p.mediaUrl);
+    return GridView.builder(
+      padding: const EdgeInsets.all(6),
+      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: 3,
+        crossAxisSpacing: 6,
+        mainAxisSpacing: 6,
+        childAspectRatio: 1,
+      ),
+      itemCount: products.length,
+      itemBuilder: (context, i) {
+        final p = products[i];
+        final String displayUrl = p.isVideo
+            ? ((p.thumbnailUrl != null && p.thumbnailUrl!.isNotEmpty)
+                ? resolveMediaUrl(p.thumbnailUrl!)
+                : resolveMediaUrl(p.mediaUrl))
+            : resolveMediaUrl(p.mediaUrl);
 
-      return GestureDetector(
-        onTap: () async {
-          final refreshed = await Navigator.push(
-            context,
-            MaterialPageRoute(
-              builder: (_) => MediaViewerPage(
-                posts: products,
-                initialIndex: i,
+        return GestureDetector(
+          onTap: () async {
+            final refreshed = await Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (_) => MediaViewerPage(
+                  posts: products,
+                  initialIndex: i,
+                ),
               ),
-            ),
-          );
+            );
 
-          if (refreshed == true) {
-            _loadPublications();
-          }
-        },
-        child: ClipRRect(
-          borderRadius: BorderRadius.circular(10),
-          child: Stack(
-            children: [
-              Positioned.fill(
-                child: displayUrl.isNotEmpty
-                    ? CachedNetworkImage(
-                        imageUrl: displayUrl,
-                        fit: BoxFit.cover,
-                        placeholder: (context, url) =>
-                            Container(color: Colors.grey[200]),
-                        errorWidget: (context, url, error) => Container(
+            if (refreshed == true) {
+              _loadPublications();
+            }
+          },
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(10),
+            child: Stack(
+              children: [
+                Positioned.fill(
+                  child: displayUrl.isNotEmpty
+                      ? CachedNetworkImage(
+                          imageUrl: displayUrl,
+                          fit: BoxFit.cover,
+                          placeholder: (context, url) =>
+                              Container(color: Colors.grey[200]),
+                          errorWidget: (context, url, error) => Container(
+                            color: Colors.black,
+                            child: const Icon(Icons.image_not_supported,
+                                color: Colors.white, size: 28),
+                          ),
+                        )
+                      : Container(
                           color: Colors.black,
                           child: const Icon(Icons.image_not_supported,
                               color: Colors.white, size: 28),
                         ),
-                      )
-                    : Container(
-                        color: Colors.black,
-                        child: const Icon(Icons.image_not_supported,
-                            color: Colors.white, size: 28),
-                      ),
-              ),
-              if (p.isVideo)
-                const Positioned(
-                  bottom: 6,
-                  right: 6,
-                  child: Icon(Icons.play_arrow,
-                      color: Colors.white, size: 22),
                 ),
-            ],
+                if (p.isVideo)
+                  const Positioned(
+                    bottom: 6,
+                    right: 6,
+                    child:
+                        Icon(Icons.play_arrow, color: Colors.white, size: 22),
+                  ),
+                Positioned(
+                  left: 6,
+                  bottom: 6,
+                  child: Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                    decoration: BoxDecoration(
+                      color: Colors.black54,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(
+                          Icons.remove_red_eye,
+                          color: Colors.white,
+                          size: 12,
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          '${p.viewsCount ?? 0}',
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
           ),
-        ),
-      );
-    },
-  );
-}
+        );
+      },
+    );
+  }
 
   Widget _buildDraftsList() {
     if (localDrafts.isEmpty) {
@@ -1837,7 +1985,6 @@ Widget build(BuildContext context) {
                                   color: Colors.white, size: 28),
                             ),
                 ),
-
                 if (d.isVideo)
                   const Positioned(
                     bottom: 6,
@@ -1966,9 +2113,8 @@ class _LocalDraftPreviewPageState extends State<LocalDraftPreviewPage> {
             onPressed: _deleting ? null : _deleteDraft,
           ),
           TextButton(
-            onPressed: (!canPublish || _publishing || isUploading)
-                ? null
-                : _publish,
+            onPressed:
+                (!canPublish || _publishing || isUploading) ? null : _publish,
             child: _publishing || isUploading
                 ? const Text(
                     "Envoi...",
@@ -1986,10 +2132,9 @@ class _LocalDraftPreviewPageState extends State<LocalDraftPreviewPage> {
             ? Stack(
                 alignment: Alignment.center,
                 children: [
-                  if (_controller == null ||
-                      !_controller!.value.isInitialized)
-                    (widget.draft.thumbnailLocalPath != null
-                            && File(widget.draft.thumbnailLocalPath!).existsSync())
+                  if (_controller == null || !_controller!.value.isInitialized)
+                    (widget.draft.thumbnailLocalPath != null &&
+                            File(widget.draft.thumbnailLocalPath!).existsSync())
                         ? Image.file(
                             File(widget.draft.thumbnailLocalPath!),
                             fit: BoxFit.cover,
