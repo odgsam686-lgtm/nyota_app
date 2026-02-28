@@ -1,8 +1,12 @@
-import 'package:flutter/material.dart';
+import 'dart:async';
+
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:flutter/material.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:video_player/video_player.dart';
-import '../widgets/fullscreen_media_actions.dart';
+
 import '../utils/media_resolver.dart';
+import '../widgets/fullscreen_media_actions.dart';
 import 'comments_page.dart';
 
 class ProductDetailPage extends StatefulWidget {
@@ -14,50 +18,113 @@ class ProductDetailPage extends StatefulWidget {
 }
 
 class _ProductDetailPageState extends State<ProductDetailPage> {
+  final SupabaseClient _supabase = Supabase.instance.client;
   VideoPlayerController? _videoController;
-@override
-void initState() {
-  super.initState();
+  RealtimeChannel? _commentsChannel;
+  Timer? _commentsRefreshDebounce;
+  int _commentsCount = 0;
 
-  final type = widget.product['media_type'];
-  final media = widget.product['media_url']?.toString() ?? '';
-  final dynamic rawVariants = widget.product['video_variants'];
-  final Map<String, dynamic>? variants =
-      rawVariants is Map ? Map<String, dynamic>.from(rawVariants) : null;
+  @override
+  void initState() {
+    super.initState();
 
-  if (type == 'video' && media.isNotEmpty) {
-    _initVideoController(media, variants);
+    _commentsCount = (widget.product['comments_count'] is int)
+        ? widget.product['comments_count'] as int
+        : int.tryParse(widget.product['comments_count']?.toString() ?? '0') ?? 0;
+
+    _initCommentsRealtime();
+
+    final type = widget.product['media_type'];
+    final media = widget.product['media_url']?.toString() ?? '';
+    final dynamic rawVariants = widget.product['video_variants'];
+    final Map<String, dynamic>? variants =
+        rawVariants is Map ? Map<String, dynamic>.from(rawVariants) : null;
+
+    if (type == 'video' && media.isNotEmpty) {
+      _initVideoController(media, variants);
+    }
   }
-}
 
-Future<void> _initVideoController(
-  String mediaPath,
-  Map<String, dynamic>? variants,
-) async {
-  final resolvedUrl = await resolveBestVideoUrl(
-    mediaPath: mediaPath,
-    variants: variants,
-  );
+  void _initCommentsRealtime() {
+    final postId = widget.product['id']?.toString();
+    if (postId == null || postId.isEmpty) return;
 
-  final controller = createVideoController(resolvedUrl);
-  _videoController = controller;
+    _commentsChannel = _supabase.channel('product-comments-$postId');
+    _commentsChannel!
+        .onPostgresChanges(
+          event: PostgresChangeEvent.all,
+          schema: 'public',
+          table: 'comments',
+          callback: (payload) {
+            final changedPostId =
+                (payload.newRecord['post_id'] ?? payload.oldRecord['post_id'] ?? '')
+                    .toString();
+            if (changedPostId != postId) return;
+            _scheduleRefreshCommentsCount();
+          },
+        )
+        .subscribe();
+  }
 
-  await controller.initialize();
+  void _scheduleRefreshCommentsCount() {
+    _commentsRefreshDebounce?.cancel();
+    _commentsRefreshDebounce = Timer(
+      const Duration(milliseconds: 220),
+      () => unawaited(_refreshCommentsCount()),
+    );
+  }
 
-  if (!mounted) return;
+  Future<void> _refreshCommentsCount() async {
+    final postId = widget.product['id']?.toString();
+    if (postId == null || postId.isEmpty) return;
+    try {
+      final rows = await _supabase
+          .from('comments')
+          .select('id')
+          .eq('post_id', postId);
+      if (!mounted) return;
+      final count = rows.length;
+      setState(() {
+        _commentsCount = count;
+        widget.product['comments_count'] = count;
+      });
+    } catch (_) {
+      // Keep UI stable if realtime refresh fails.
+    }
+  }
 
-  // Forcer la première frame
-  await controller.play();
-  await Future.delayed(const Duration(milliseconds: 300));
-  await controller.pause();
-  await controller.seekTo(Duration.zero);
+  Future<void> _initVideoController(
+    String mediaPath,
+    Map<String, dynamic>? variants,
+  ) async {
+    final resolvedUrl = await resolveBestVideoUrl(
+      mediaPath: mediaPath,
+      variants: variants,
+    );
 
-  setState(() {});
-}
+    final controller = createVideoController(resolvedUrl);
+    _videoController = controller;
 
+    await controller.initialize();
+
+    if (!mounted) return;
+
+    // Force first frame.
+    await controller.play();
+    await Future.delayed(const Duration(milliseconds: 300));
+    await controller.pause();
+    await controller.seekTo(Duration.zero);
+
+    setState(() {});
+  }
 
   @override
   void dispose() {
+    _commentsRefreshDebounce?.cancel();
+    if (_commentsChannel != null) {
+      _supabase.removeChannel(_commentsChannel!);
+      _commentsChannel = null;
+    }
     _videoController?.dispose();
     super.dispose();
   }
@@ -67,12 +134,10 @@ Future<void> _initVideoController(
     final media = widget.product['media_url']?.toString() ?? '';
     final resolvedMedia = resolveMediaUrl(media);
     final type = widget.product['media_type'];
-    final title =
-        widget.product['title'] ?? widget.product['description'] ?? '';
+    final title = widget.product['title'] ?? widget.product['description'] ?? '';
     final seller = widget.product['seller_name'] ?? '';
-    final price = widget.product['price'] != null
-        ? widget.product['price'].toString()
-        : '';
+    final price =
+        widget.product['price'] != null ? widget.product['price'].toString() : '';
     final currency = widget.product['currency'] ?? 'XOF';
 
     return Scaffold(
@@ -80,7 +145,6 @@ Future<void> _initVideoController(
       body: SafeArea(
         child: Stack(
           children: [
-            /// 🔹 MEDIA (IMAGE OU VIDÉO)
             Positioned.fill(
               child: type == 'video'
                   ? (_videoController != null &&
@@ -101,13 +165,11 @@ Future<void> _initVideoController(
                           placeholder: (_, __) =>
                               const Center(child: CircularProgressIndicator()),
                           errorWidget: (_, __, ___) => const Center(
-                              child: Icon(Icons.broken_image,
-                                  color: Colors.white)),
+                            child: Icon(Icons.broken_image, color: Colors.white),
+                          ),
                         )
                       : Container(color: Colors.grey.shade900)),
             ),
-
-            /// 🔹 BOUTON RETOUR
             Positioned(
               left: 8,
               top: 8,
@@ -119,8 +181,6 @@ Future<void> _initVideoController(
                 ),
               ),
             ),
-
-            /// 🔹 PLAY / PAUSE POUR VIDÉO
             if (type == 'video' && _videoController != null)
               Positioned(
                 right: 12,
@@ -144,8 +204,6 @@ Future<void> _initVideoController(
                   ),
                 ),
               ),
-
-            /// 🔹 INFOS PRODUIT
             Positioned(
               left: 0,
               right: 0,
@@ -154,10 +212,7 @@ Future<void> _initVideoController(
                 padding: const EdgeInsets.all(16),
                 decoration: BoxDecoration(
                   gradient: LinearGradient(
-                    colors: [
-                      Colors.transparent,
-                      Colors.black.withOpacity(0.85)
-                    ],
+                    colors: [Colors.transparent, Colors.black.withOpacity(0.85)],
                     begin: Alignment.topCenter,
                     end: Alignment.bottomCenter,
                   ),
@@ -194,12 +249,13 @@ Future<void> _initVideoController(
                           onPressed: () {
                             ScaffoldMessenger.of(context).showSnackBar(
                               const SnackBar(
-                                  content: Text('Ajouté au panier (MVP)')),
+                                content: Text('Ajouté au panier (MVP)'),
+                              ),
                             );
                           },
                         ),
                       ],
-                    )
+                    ),
                   ],
                 ),
               ),
@@ -209,13 +265,12 @@ Future<void> _initVideoController(
               sellerId: widget.product['seller_id'],
               avatarUrl: widget.product['avatar_url'],
               likesCount: widget.product['likes'] ?? 0,
-              commentsCount: widget.product['comments_count'] ?? 0,
-              isLiked: false, // ou calculé si connecté
-              onLike: () {
-                // même logique que le feed
-              },
+              commentsCount: _commentsCount,
+              isLiked: false,
+              onLike: () {},
               onComment: () {
-                openComments(context, widget.product['id']);
+                openComments(context, widget.product['id'])
+                    .whenComplete(_refreshCommentsCount);
               },
               onOpenProfile: () {
                 Navigator.pushNamed(

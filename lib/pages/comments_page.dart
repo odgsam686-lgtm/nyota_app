@@ -262,18 +262,8 @@ class _CommentBottomSheetState extends State<CommentBottomSheet> {
   }
 
   Future<void> _syncCommentsCount() async {
-    try {
-      final rows = await supabase
-          .from('comments')
-          .select('id')
-          .eq('post_id', widget.postId);
-      final count = rows.length;
-      await supabase
-          .from('posts')
-          .update({'comments_count': count}).eq('id', widget.postId);
-    } catch (e) {
-      debugPrint('sync comments_count error: $e');
-    }
+    // comments_count is derived from public.comments (no posts.comments_count column)
+    return;
   }
 
   Future<void> _pickImage() async {

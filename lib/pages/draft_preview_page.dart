@@ -120,7 +120,7 @@ class _DraftPreviewPageState extends State<DraftPreviewPage> {
     setState(() => _loading = true);
 
     try {
-      await Supabase.instance.client.from('posts').insert({
+      final postInsert = await Supabase.instance.client.from('posts').insert({
         "seller_id": user.uid,
         "seller_name": user.email ?? "vendeur",
         "description": widget.draft.description,
@@ -128,7 +128,16 @@ class _DraftPreviewPageState extends State<DraftPreviewPage> {
         "is_video": widget.draft.isVideo,
         "created_at": DateTime.now().toIso8601String(),
         "likes": 0,
-      });
+      }).select('id').single();
+
+      final postId = postInsert['id']?.toString();
+      debugPrint("draft publish post insert ok post_id=$postId");
+      if (postId != null && postId.isNotEmpty) {
+        await _copyUserLocationToPostLocation(
+          firebaseUid: user.uid,
+          postId: postId,
+        );
+      }
 
       await Supabase.instance.client
           .from('drafts')
@@ -148,6 +157,61 @@ class _DraftPreviewPageState extends State<DraftPreviewPage> {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text("Erreur lors de la publication")),
       );
+    }
+  }
+
+  Future<void> _copyUserLocationToPostLocation({
+    required String firebaseUid,
+    required String postId,
+  }) async {
+    try {
+      final supabase = Supabase.instance.client;
+      final row = await supabase
+          .from('user_locations')
+          .select('latitude, longitude, zone')
+          .eq('user_id', firebaseUid)
+          .maybeSingle();
+
+      if (row == null) {
+        debugPrint(
+            'draft post_locations skipped: no user_locations for user=$firebaseUid');
+        return;
+      }
+
+      double? toDouble(dynamic value) {
+        if (value is double) return value;
+        if (value is num) return value.toDouble();
+        return double.tryParse(value?.toString() ?? '');
+      }
+
+      final latitude = toDouble(row['latitude']);
+      final longitude = toDouble(row['longitude']);
+      final zone = row['zone']?.toString();
+
+      if (latitude == null || longitude == null) {
+        debugPrint(
+            'draft post_locations skipped: invalid coordinates user=$firebaseUid row=$row');
+        return;
+      }
+
+      final payload = <String, dynamic>{
+        'post_id': postId,
+        'latitude': latitude,
+        'longitude': longitude,
+      };
+      if (zone != null && zone.trim().isNotEmpty) {
+        payload['zone'] = zone.trim();
+      }
+
+      await supabase.from('post_locations').upsert(
+            payload,
+            onConflict: 'post_id',
+          );
+
+      debugPrint(
+          'draft post_locations upsert post=$postId lat=$latitude lng=$longitude zone=${payload['zone']}');
+    } catch (e) {
+      debugPrint('draft post_locations error post=$postId user=$firebaseUid $e');
     }
   }
 

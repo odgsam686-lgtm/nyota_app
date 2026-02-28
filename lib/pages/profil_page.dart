@@ -72,6 +72,7 @@ class _ProfilPageState extends State<ProfilPage> with RouteAware {
   @override
   void initState() {
     super.initState();
+    DraftLocalStore.changes.addListener(_onDraftStoreChanged);
     DraftOfflineManager.normalizeDraftsOnStartup();
     _initConnectivity();
     final user = FirebaseAuth.instance.currentUser;
@@ -109,6 +110,7 @@ class _ProfilPageState extends State<ProfilPage> with RouteAware {
 
   @override
   void dispose() {
+    DraftLocalStore.changes.removeListener(_onDraftStoreChanged);
     _postViewsRefreshDebounce?.cancel();
     if (_postViewsChannel != null) {
       supabase.removeChannel(_postViewsChannel!);
@@ -116,6 +118,11 @@ class _ProfilPageState extends State<ProfilPage> with RouteAware {
     routeObserver.unsubscribe(this);
     _connectivitySub.cancel();
     super.dispose();
+  }
+
+  void _onDraftStoreChanged() {
+    if (!mounted) return;
+    _loadDrafts();
   }
 
   void _initConnectivity() {

@@ -13,6 +13,7 @@ class SettingsPage extends StatelessWidget {
 
     // ✅ 2. Déconnexion Supabase
     await supa.Supabase.instance.client.auth.signOut();
+    if (!context.mounted) return;
 
     // ✅ 3. Redirection PROPRE (reset navigation)
     Navigator.of(context).pushAndRemoveUntil(
@@ -41,9 +42,12 @@ class SettingsPage extends StatelessWidget {
             title: Text('Sécurité'),
           ),
 
-          const ListTile(
-            leading: Icon(Icons.notifications_none),
-            title: Text('Notifications'),
+          ListTile(
+            leading: const Icon(Icons.notifications_none),
+            title: const Text('Notifications'),
+            onTap: () {
+              Navigator.of(context).pushNamed('/notifications');
+            },
           ),
 
           const Divider(height: 32),

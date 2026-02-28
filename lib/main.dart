@@ -1,13 +1,17 @@
 // main.dart
+import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_crashlytics/firebase_crashlytics.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:nyota_app/pages/public_profile_page.dart';
+import 'package:nyota_app/pages/notifications_page.dart';
 import 'package:nyota_app/services/deep_link_services.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:geolocator/geolocator.dart';
@@ -34,6 +38,8 @@ import 'package:nyota_app/pages/forgot_password_phone_page.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:nyota_app/services/unread_counter_service.dart';
 import 'package:nyota_app/services/notification_service.dart';
+import 'package:nyota_app/services/crashlytics_logger.dart';
+import 'package:nyota_app/services/presence_service.dart';
 import 'package:nyota_app/widgets/badge.dart';
 
 final RouteObserver<ModalRoute<void>> routeObserver =
@@ -42,35 +48,94 @@ final GlobalKey<NavigatorState> appNavigatorKey = GlobalKey<NavigatorState>();
 final GlobalKey<ScaffoldMessengerState> appScaffoldMessengerKey =
     GlobalKey<ScaffoldMessengerState>();
 
+bool _isSupabaseRealtimeTimeoutError(Object error) {
+  final text = error.toString();
+  return text.contains('RealtimeSubscribeException') &&
+      text.contains('RealtimeSubscribeStatus.timedOut');
+}
+
+Future<void> _recordCrashlyticsError(
+  Object error,
+  StackTrace stack, {
+  bool fatal = true,
+}) async {
+  if (_isSupabaseRealtimeTimeoutError(error)) {
+    await FirebaseCrashlytics.instance.recordError(
+      error,
+      stack,
+      fatal: false,
+      reason: 'supabase_realtime_subscribe_timeout',
+    );
+    debugPrint('Supabase realtime subscribe timeout (non-fatal): $error');
+    return;
+  }
+  await FirebaseCrashlytics.instance.recordError(error, stack, fatal: fatal);
+}
+
 void main() async {
-  WidgetsBinding widgetsBinding = WidgetsFlutterBinding.ensureInitialized();
-  widgetsBinding.addObserver(LifecycleEventHandler(
-    resumeCallBack: () async {},
-  ));
-  WidgetsFlutterBinding.ensureInitialized();
+  await runZonedGuarded<Future<void>>(
+    () async {
+      WidgetsBinding widgetsBinding = WidgetsFlutterBinding.ensureInitialized();
+      widgetsBinding.addObserver(LifecycleEventHandler(
+        resumeCallBack: () async {},
+      ));
 
-  await Firebase.initializeApp();
-  await Hive.initFlutter();
-  await Hive.openBox('cacheBox');
-  await HiveHelper.initHive();
+      await Firebase.initializeApp();
 
-  _initOfflineFlushListener();
+      FlutterError.onError = (FlutterErrorDetails details) {
+        final error = details.exception;
+        final stack = details.stack ?? StackTrace.current;
+        if (_isSupabaseRealtimeTimeoutError(error)) {
+          FirebaseCrashlytics.instance.recordError(
+            error,
+            stack,
+            fatal: false,
+            reason: 'supabase_realtime_subscribe_timeout',
+          );
+          debugPrint('Supabase realtime subscribe timeout (non-fatal): $error');
+          return;
+        }
+        FirebaseCrashlytics.instance.recordFlutterFatalError(details);
+      };
+      PlatformDispatcher.instance.onError = (error, stack) {
+        _recordCrashlyticsError(error, stack, fatal: true);
+        return true;
+      };
 
-  await setupFCM();
+      await CrashlyticsLogger.initSessionMetadata();
+      await CrashlyticsLogger.setUser(FirebaseAuth.instance.currentUser);
+      FirebaseAuth.instance.authStateChanges().listen((user) {
+        CrashlyticsLogger.setUser(user);
+      });
 
-  // Test Hive
-  var box = HiveHelper.conversationsBox;
-  box.put('user1', 'Bonjour');
-  print(box.get('user1'));
+      await Hive.initFlutter();
+      await Hive.openBox('cacheBox');
+      await HiveHelper.initHive();
 
-  // SUPABASE
-  await supa.Supabase.initialize(
-    url: 'https://uczycvteyfgdhfjeuglw.supabase.co',
-    anonKey:
-        'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVjenljdnRleWZnZGhmamV1Z2x3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjMxMzA1NzMsImV4cCI6MjA3ODcwNjU3M30.4KVurTgyZRaqox9q0NcS0G9_zX5TADsDE4hw8BUhI5E',
+      _initOfflineFlushListener();
+
+      await setupFCM();
+
+      // Test Hive
+      var box = HiveHelper.conversationsBox;
+      box.put('user1', 'Bonjour');
+      print(box.get('user1'));
+
+      // SUPABASE
+      await supa.Supabase.initialize(
+        url: 'https://uczycvteyfgdhfjeuglw.supabase.co',
+        anonKey:
+            'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVjenljdnRleWZnZGhmamV1Z2x3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjMxMzA1NzMsImV4cCI6MjA3ODcwNjU3M30.4KVurTgyZRaqox9q0NcS0G9_zX5TADsDE4hw8BUhI5E',
+      );
+
+      runApp(const MyApp());
+
+
+    },
+    (error, stack) {
+      _recordCrashlyticsError(error, stack, fatal: true);
+    },
   );
-
-  runApp(const MyApp());
 }
 
 void _initOfflineFlushListener() {
@@ -99,27 +164,28 @@ Future<void> setupFCM() async {
     sound: true,
   );
 
-  // Listener des notifications en premier plan
   FirebaseMessaging.onMessage.listen((RemoteMessage message) {
     if (message.notification != null) {
-      print('Notification reçue: ${message.notification!.title}');
+      debugPrint('Notification re?ue: ${message.notification!.title}');
     }
   });
 
-  // Listener quand on ouvre une notification
   FirebaseMessaging.onMessageOpenedApp.listen((message) {
-    print('Notification ouverte: ${message.notification?.title}');
+    debugPrint('Notification ouverte: ${message.notification?.title}');
   });
 
-  // 🔥 Le token doit être protégé
   try {
     String? token = await messaging.getToken();
-    print('FCM Token: $token');
+    if (token != null) {
+      final masked = token.length > 16
+          ? '${token.substring(0, 8)}...${token.substring(token.length - 6)}'
+          : token;
+      debugPrint('FCM Token: ${kDebugMode ? token : masked}');
+    }
   } catch (e) {
-    print("⚠️ Impossible d'obtenir le token FCM : $e");
+    debugPrint("Impossible d'obtenir le token FCM : $e");
   }
 }
-
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
@@ -135,6 +201,35 @@ class MyApp extends StatelessWidget {
       navigatorObservers: [routeObserver],
       title: '',
       debugShowCheckedModeBanner: false,
+      builder: (context, child) {
+        final root = child ?? const SizedBox.shrink();
+        if (!kDebugMode) return root;
+        return Stack(
+          children: [
+            root,
+            Positioned(
+              top: 6,
+              left: 6,
+              child: Opacity(
+                opacity: 0.08,
+                child: GestureDetector(
+                  onLongPress: () {
+                    FirebaseCrashlytics.instance.crash();
+                  },
+                  child: Container(
+                    width: 18,
+                    height: 18,
+                    decoration: BoxDecoration(
+                      color: Colors.red,
+                      borderRadius: BorderRadius.circular(9),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        );
+      },
       theme: ThemeData(primarySwatch: Colors.deepPurple),
       home: StreamBuilder<User?>(
         stream: FirebaseAuth.instance.authStateChanges(),
@@ -187,6 +282,10 @@ class MyApp extends StatelessWidget {
             final sellerId = settings.arguments as String;
             return MaterialPageRoute(
               builder: (_) => PublicProfilePage(sellerId: sellerId),
+            );
+          case '/notifications':
+            return MaterialPageRoute(
+              builder: (_) => const NotificationsPage(),
             );
 
           default:
@@ -398,6 +497,7 @@ if (res.status != 200) {
 
   print('🟢 STEP 11 : Navigation');
 
+  if (!mounted) return;
   Navigator.pushReplacement(
     context,
     MaterialPageRoute(
@@ -405,10 +505,14 @@ if (res.status != 200) {
     ),
   );
 }catch (e) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text("Erreur : $e")));
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text("Erreur : $e")));
+      }
     } finally {
-      setState(() => isLoading = false);
+      if (mounted) {
+        setState(() => isLoading = false);
+      }
     }
   }
 
@@ -1033,6 +1137,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     _deepLinkService.init(context);
     UnreadCounterService.instance.start(widget.user.uid);
     NotificationService.instance.initForUser(widget.user.uid);
+    unawaited(PresenceService.instance.start(widget.user.uid));
     // charger les produits locaux immédiatement (si box contient)
     final localProducts = legacy.OfflineManager.getLocalProducts();
     if (localProducts.isNotEmpty) {
@@ -1065,6 +1170,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   void dispose() {
     UnreadCounterService.instance.stop();
     NotificationService.instance.dispose();
+    unawaited(PresenceService.instance.stop());
     super.dispose();
   }
 
@@ -1143,6 +1249,15 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     finalFeed.addAll(trending);
     finalFeed.addAll(others);
     return finalFeed;
+  }
+
+  Stream<int> _notificationUnreadCountStream() {
+    return supa.Supabase.instance.client
+        .from('app_notifications')
+        .stream(primaryKey: ['id'])
+        .eq('user_id', widget.user.uid)
+        .order('created_at', ascending: false)
+        .map((rows) => rows.where((row) => row['is_read'] != true).length);
   }
 
   // =================== PICK MEDIA ===================
@@ -1374,7 +1489,16 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     return Scaffold(
       body: AnnotatedRegion<SystemUiOverlayStyle>(
         value: SystemUiOverlayStyle.dark,
-        child: _getBody(),
+        child: IndexedStack(
+          index: _currentIndex,
+          children: [
+            FeedPage(isVisible: _currentIndex == 0),
+            const CatalogPage(),
+            const ProfilPage(),
+            _buildCart(),
+            _buildWallet(),
+          ],
+        ),
       ),
       bottomNavigationBar: BottomNavigationBar(
         backgroundColor: Colors.white,
@@ -1405,6 +1529,29 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       ),
       floatingActionButton: Stack(
         children: [
+          if (_currentIndex == 0)
+            Positioned(
+              bottom: 88,
+              right: 16,
+              child: StreamBuilder<int>(
+                stream: _notificationUnreadCountStream(),
+                builder: (context, snapshot) {
+                  final unread = snapshot.data ?? 0;
+                  if (unread <= 0) {
+                    return const SizedBox.shrink();
+                  }
+                  return BadgeWidget(
+                    count: unread,
+                    child: FloatingActionButton(
+                      heroTag: 'notificationsBtn',
+                      onPressed: _openNotifications,
+                      child: const Icon(Icons.notifications),
+                      tooltip: 'Notifications',
+                    ),
+                  );
+                },
+              ),
+            ),
           if (_currentIndex == 0 || _currentIndex == 2)
             Positioned(
               bottom: 16,
@@ -1460,10 +1607,16 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     );
   }
 
+  Future<void> _openNotifications() async {
+    await Navigator.of(context).pushNamed('/notifications');
+    if (!mounted) return;
+    setState(() {});
+  }
+
   Widget _getBody() {
     switch (_currentIndex) {
       case 0:
-        return const FeedPage();
+        return FeedPage(isVisible: true);
       case 1:
         return const CatalogPage();
       case 2:
@@ -1473,7 +1626,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       case 4:
         return _buildWallet();
       default:
-        return const FeedPage();
+        return FeedPage(isVisible: true);
     }
   }
 
@@ -1978,3 +2131,4 @@ class LifecycleEventHandler extends WidgetsBindingObserver {
     }
   }
 }
+

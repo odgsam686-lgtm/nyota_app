@@ -3,6 +3,8 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/services.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:nyota_app/pages/notifications_page.dart';
+import 'package:nyota_app/pages/settings_page.dart' as app_settings;
 
 class PrivateProfileMenu extends StatelessWidget {
   const PrivateProfileMenu({super.key});
@@ -18,7 +20,7 @@ class PrivateProfileMenu extends StatelessWidget {
           mainAxisSize: MainAxisSize.min,
           children: [
             _item(context, "Paramètres & confidentialité", Icons.lock,
-                const SettingsPage()),
+                const app_settings.SettingsPage()),
             _item(context, "Ton code QR", Icons.qr_code, const QRCodePage()),
             _item(context, "Conditions d’utilisation", Icons.description,
                 const TermsPage()),
@@ -32,6 +34,7 @@ class PrivateProfileMenu extends StatelessWidget {
                   style: TextStyle(color: Colors.red)),
               onTap: () async {
                 await FirebaseAuth.instance.signOut();
+                if (!context.mounted) return;
                 Navigator.popUntil(context, (r) => r.isFirst);
               },
             ),
@@ -80,6 +83,17 @@ class SettingsPage extends StatelessWidget {
       [
         const ListTile(title: Text("Modifier le profil")),
         const ListTile(title: Text("Changer mot de passe")),
+        ListTile(
+          title: const Text("Notifications"),
+          onTap: () {
+            Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (_) => const NotificationsPage(),
+              ),
+            );
+          },
+        ),
         const ListTile(title: Text("Bloquer des utilisateurs")),
         ListTile(
           title: const Text("Supprimer le compte",
@@ -132,6 +146,7 @@ class QRCodePage extends StatelessWidget {
                   await Clipboard.setData(
                     ClipboardData(text: profileLink),
                   );
+                  if (!context.mounted) return;
                   ScaffoldMessenger.of(context).showSnackBar(
                     const SnackBar(content: Text("Lien copié")),
                   );

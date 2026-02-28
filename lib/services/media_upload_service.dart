@@ -4,6 +4,7 @@ import 'package:video_thumbnail/video_thumbnail.dart';
 import 'package:path_provider/path_provider.dart';
 import '../utils/storage_url.dart';
 import 'package:flutter/foundation.dart';
+import 'crashlytics_logger.dart';
 
 class MediaUploadService {
   static const String bucketName = 'posts';
@@ -20,57 +21,72 @@ class MediaUploadService {
     String? thumbnailFilePath,
     String? objectId,
   }) async {
-    final supabase = Supabase.instance.client;
+    try {
+      final supabase = Supabase.instance.client;
 
-    final timestamp = DateTime.now().millisecondsSinceEpoch;
-    final uploadId = objectId ?? 'upload_$timestamp';
-    String mediaPath;
-    String mediaUrl;
-    String? thumbnailPath;
-    String? thumbnailUrl;
+      final timestamp = DateTime.now().millisecondsSinceEpoch;
+      final uploadId = objectId ?? 'upload_$timestamp';
+      String mediaPath;
+      String mediaUrl;
+      String? thumbnailPath;
+      String? thumbnailUrl;
 
-    // ==========================
-    // VIDEO
-    // ==========================
-    if (isVideo) {
-      // Upload thumbnail only if provided
-      if (thumbnailFilePath != null) {
-        final thumbFile = File(thumbnailFilePath);
-        if (thumbFile.existsSync()) {
-          thumbnailPath = _buildPath(userId, uploadId, 'thumb.jpg');
-          print("UPLOAD bucket=$bucketName path=$thumbnailPath");
-          await supabase.storage
-              .from(bucketName)
-              .upload(thumbnailPath, thumbFile);
-          thumbnailUrl = storagePublicUrl(bucketName, thumbnailPath);
+      CrashlyticsLogger.log(
+          'post_media_upload:start isVideo=$isVideo user=$userId uploadId=$uploadId');
+
+      // ==========================
+      // VIDEO
+      // ==========================
+      if (isVideo) {
+        // Upload thumbnail only if provided
+        if (thumbnailFilePath != null) {
+          final thumbFile = File(thumbnailFilePath);
+          if (thumbFile.existsSync()) {
+            thumbnailPath = _buildPath(userId, uploadId, 'thumb.jpg');
+            print("UPLOAD bucket=$bucketName path=$thumbnailPath");
+            await supabase.storage
+                .from(bucketName)
+                .upload(thumbnailPath, thumbFile);
+            thumbnailUrl = storagePublicUrl(bucketName, thumbnailPath);
+          }
         }
+
+        // Upload video
+        final ext = file.path.split('.').last;
+        mediaPath = _buildPath(userId, uploadId, 'media.$ext');
+        print("UPLOAD bucket=$bucketName path=$mediaPath");
+        await supabase.storage.from(bucketName).upload(mediaPath, file);
+        mediaUrl = storagePublicUrl(bucketName, mediaPath);
       }
 
-      // Upload video
-      final ext = file.path.split('.').last;
-      mediaPath = _buildPath(userId, uploadId, 'media.$ext');
-      print("UPLOAD bucket=$bucketName path=$mediaPath");
-      await supabase.storage.from(bucketName).upload(mediaPath, file);
-      mediaUrl = storagePublicUrl(bucketName, mediaPath);
-    }
+      // ==========================
+      // IMAGE
+      // ==========================
+      else {
+        final ext = file.path.split('.').last;
+        mediaPath = _buildPath(userId, uploadId, 'media.$ext');
+        print("UPLOAD bucket=$bucketName path=$mediaPath");
+        await supabase.storage.from(bucketName).upload(mediaPath, file);
+        mediaUrl = storagePublicUrl(bucketName, mediaPath);
+      }
 
-    // ==========================
-    // IMAGE
-    // ==========================
-    else {
-      final ext = file.path.split('.').last;
-      mediaPath = _buildPath(userId, uploadId, 'media.$ext');
-      print("UPLOAD bucket=$bucketName path=$mediaPath");
-      await supabase.storage.from(bucketName).upload(mediaPath, file);
-      mediaUrl = storagePublicUrl(bucketName, mediaPath);
+      CrashlyticsLogger.log(
+          'post_media_upload:done isVideo=$isVideo mediaPath=$mediaPath');
+      return {
+        'media_url': mediaUrl,
+        'thumbnail_url': thumbnailUrl,
+        'media_path': mediaPath,
+        'thumbnail_path': thumbnailPath,
+        'is_video': isVideo,
+      };
+    } catch (e, s) {
+      debugPrint('MediaUploadService.uploadMedia error: $e');
+      await CrashlyticsLogger.recordNonFatal(
+        e,
+        s,
+        reason: 'post_media_upload',
+      );
+      rethrow;
     }
-
-    return {
-      'media_url': mediaUrl,
-      'thumbnail_url': thumbnailUrl,
-      'media_path': mediaPath,
-      'thumbnail_path': thumbnailPath,
-      'is_video': isVideo,
-    };
   }
 }

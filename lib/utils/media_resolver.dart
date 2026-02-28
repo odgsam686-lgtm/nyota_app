@@ -3,6 +3,7 @@ import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:video_player/video_player.dart';
 import 'storage_url.dart';
+import '../services/crashlytics_logger.dart';
 
 bool isLocalMediaPath(String raw) {
   if (raw.isEmpty) return false;
@@ -30,34 +31,48 @@ Future<String> resolveBestVideoUrl({
   required String mediaPath,
   Map<String, dynamic>? variants,
 }) async {
-  if (mediaPath.isEmpty) return mediaPath;
-  if (isLocalMediaPath(mediaPath)) return mediaPath;
+  try {
+    if (mediaPath.isEmpty) return mediaPath;
+    if (isLocalMediaPath(mediaPath)) return mediaPath;
 
-  if (variants == null || variants.isEmpty) {
+    if (variants == null || variants.isEmpty) {
+      CrashlyticsLogger.log('video_resolver:no_variants path=$mediaPath');
+      return resolveMediaUrl(mediaPath);
+    }
+
+    final connectivity = await Connectivity().checkConnectivity();
+    List<String> preference;
+    switch (connectivity) {
+      case ConnectivityResult.wifi:
+      case ConnectivityResult.ethernet:
+      case ConnectivityResult.vpn:
+        preference = const ['1080', '720', '360'];
+        break;
+      case ConnectivityResult.mobile:
+        preference = const ['360', '720', '1080'];
+        break;
+      case ConnectivityResult.bluetooth:
+      case ConnectivityResult.other:
+        preference = const ['720', '360', '1080'];
+        break;
+      case ConnectivityResult.none:
+        CrashlyticsLogger.log('video_resolver:offline_fallback path=$mediaPath');
+        return resolveMediaUrl(mediaPath);
+    }
+
+    final chosen = _pickVariantPath(variants, preference);
+    final resolved = resolveMediaUrl(chosen ?? mediaPath);
+    CrashlyticsLogger.log(
+        'video_resolver:resolved path=$mediaPath chosen=${chosen ?? mediaPath}');
+    return resolved;
+  } catch (e, s) {
+    await CrashlyticsLogger.recordNonFatal(
+      e,
+      s,
+      reason: 'video_resolver',
+    );
     return resolveMediaUrl(mediaPath);
   }
-
-  final connectivity = await Connectivity().checkConnectivity();
-  List<String> preference;
-  switch (connectivity) {
-    case ConnectivityResult.wifi:
-    case ConnectivityResult.ethernet:
-    case ConnectivityResult.vpn:
-      preference = const ['1080', '720', '360'];
-      break;
-    case ConnectivityResult.mobile:
-      preference = const ['360', '720', '1080'];
-      break;
-    case ConnectivityResult.bluetooth:
-    case ConnectivityResult.other:
-      preference = const ['720', '360', '1080'];
-      break;
-    case ConnectivityResult.none:
-      return resolveMediaUrl(mediaPath);
-  }
-
-  final chosen = _pickVariantPath(variants, preference);
-  return resolveMediaUrl(chosen ?? mediaPath);
 }
 
 VideoPlayerController createVideoController(String raw) {

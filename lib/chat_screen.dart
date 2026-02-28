@@ -12,6 +12,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:video_player/video_player.dart';
 import 'package:nyota_app/services/video_thumbnail_service.dart';
 import 'package:nyota_app/services/notification_service.dart';
+import 'package:nyota_app/services/crashlytics_logger.dart';
 
 final ScrollController _scrollController = ScrollController();
 
@@ -54,7 +55,36 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _pendingIsVideo = false;
   VideoPlayerController? _pendingVideoController;
   bool _pickingMedia = false;
-  String _pendingText = '';
+
+  Stream<List<Map<String, dynamic>>> _presenceStream(String userId) {
+    return supabase
+        .from('user_presence')
+        .stream(primaryKey: ['user_id'])
+        .eq('user_id', userId);
+  }
+
+  String _formatLastSeenLabel(DateTime seenAt) {
+    final now = DateTime.now();
+    final diff = now.difference(seenAt.toLocal());
+    if (diff.inSeconds < 60) return 'Vu à l’instant';
+    if (diff.inMinutes < 60) return 'En ligne il y a ${diff.inMinutes} min';
+    if (diff.inHours < 24) return 'En ligne il y a ${diff.inHours} h';
+    if (diff.inDays < 7) return 'En ligne il y a ${diff.inDays} j';
+    return 'En ligne il y a ${(diff.inDays / 7).floor()} sem';
+  }
+
+  String? _presenceTextFromRow(Map<String, dynamic>? row) {
+    if (row == null) return null;
+    if (row['is_online'] == true) return 'En ligne';
+
+    final raw = row['last_seen']?.toString() ?? row['updated_at']?.toString();
+    if (raw == null || raw.isEmpty) return null;
+    final parsed = DateTime.tryParse(raw);
+    if (parsed == null) return null;
+    return _formatLastSeenLabel(parsed);
+  }
+
+  bool _presenceIsOnline(Map<String, dynamic>? row) => row?['is_online'] == true;
 
   @override
   void initState() {
@@ -96,7 +126,6 @@ class _ChatScreenState extends State<ChatScreen> {
       text: text,
       selection: TextSelection.collapsed(offset: text.length),
     );
-    _pendingText = text;
   }
 
   void _onDraftChanged(String value) {
@@ -319,27 +348,41 @@ class _ChatScreenState extends State<ChatScreen> {
     final objectPath =
         "messages/${widget.conversationId}/$clientId.$ext";
     debugPrint("CHAT UPLOAD bucket=$_mediaBucket path=$objectPath");
+    CrashlyticsLogger.log(
+        'chat_media_send:upload_start conv=${widget.conversationId} type=${isVideo ? 'video' : 'image'} path=$objectPath');
     final contentType = _contentTypeFor(ext, isVideo);
-    await supabase.storage.from(_mediaBucket).upload(
-          objectPath,
-          file,
-          fileOptions: FileOptions(
-            upsert: true,
-            contentType: contentType,
-          ),
+    try {
+      await supabase.storage.from(_mediaBucket).upload(
+            objectPath,
+            file,
+            fileOptions: FileOptions(
+              upsert: true,
+              contentType: contentType,
+            ),
+          );
+      final mediaUrl =
+          supabase.storage.from(_mediaBucket).getPublicUrl(objectPath);
+      String? thumbUrl;
+      if (isVideo) {
+        thumbUrl = await VideoThumbnailService.generateAndUpload(
+          videoFile: file,
+          userId: currentUserId,
         );
-    final mediaUrl = supabase.storage.from(_mediaBucket).getPublicUrl(objectPath);
-    String? thumbUrl;
-    if (isVideo) {
-      thumbUrl = await VideoThumbnailService.generateAndUpload(
-        videoFile: file,
-        userId: currentUserId,
+      }
+      CrashlyticsLogger.log(
+          'chat_media_send:upload_done conv=${widget.conversationId} path=$objectPath');
+      return {
+        'mediaUrl': mediaUrl,
+        'thumbUrl': thumbUrl,
+      };
+    } catch (e, s) {
+      await CrashlyticsLogger.recordNonFatal(
+        e,
+        s,
+        reason: 'chat_media_upload',
       );
+      rethrow;
     }
-    return {
-      'mediaUrl': mediaUrl,
-      'thumbUrl': thumbUrl,
-    };
   }
 
   Widget _buildPendingPreview() {
@@ -585,7 +628,6 @@ class _ChatScreenState extends State<ChatScreen> {
     setState(() {
       _localMessages.add(tempMessage);
       _controller.clear();
-      _pendingText = '';
       _clearPendingMedia();
     });
     _scrollToBottom();
@@ -632,6 +674,11 @@ class _ChatScreenState extends State<ChatScreen> {
       }
     } catch (e) {
       debugPrint("sendMessage error: $e");
+      unawaited(CrashlyticsLogger.recordNonFatal(
+        e,
+        StackTrace.current,
+        reason: 'chat_send_message',
+      ));
       if (hasMedia) {
         _updateLocalMessage(clientId, {'upload_status': 'failed'});
       }
@@ -680,30 +727,81 @@ class _ChatScreenState extends State<ChatScreen> {
         toolbarHeight: 56,
         title: InkWell(
           onTap: _openPublicProfile,
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              CircleAvatar(
-                radius: 18,
-                backgroundImage: (_receiverPhotoUrl != null &&
-                        _receiverPhotoUrl!.isNotEmpty)
-                    ? NetworkImage(_receiverPhotoUrl!)
-                    : const AssetImage("assets/images/avatar.png")
-                        as ImageProvider,
-              ),
-              const SizedBox(width: 8),
-              Flexible(
-                child: Text(
-                  (_receiverDisplayName != null &&
-                          _receiverDisplayName!.isNotEmpty)
-                      ? _receiverDisplayName!
-                      : "Utilisateur",
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(color: Colors.black),
-                ),
-              ),
-            ],
+          child: StreamBuilder<List<Map<String, dynamic>>>(
+            stream: _presenceStream(widget.receiverId),
+            builder: (context, snapshot) {
+              final rows = snapshot.data;
+              final row = (rows != null && rows.isNotEmpty) ? rows.first : null;
+              final presenceText = _presenceTextFromRow(row);
+              final isOnline = _presenceIsOnline(row);
+              final displayName = (_receiverDisplayName != null &&
+                      _receiverDisplayName!.isNotEmpty)
+                  ? _receiverDisplayName!
+                  : "Utilisateur";
+
+              return Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Stack(
+                    clipBehavior: Clip.none,
+                    children: [
+                      CircleAvatar(
+                        radius: 18,
+                        backgroundImage: (_receiverPhotoUrl != null &&
+                                _receiverPhotoUrl!.isNotEmpty)
+                            ? NetworkImage(_receiverPhotoUrl!)
+                            : const AssetImage("assets/images/avatar.png")
+                                as ImageProvider,
+                      ),
+                      if (isOnline)
+                        Positioned(
+                          right: -1,
+                          bottom: -1,
+                          child: Container(
+                            width: 11,
+                            height: 11,
+                            decoration: BoxDecoration(
+                              color: Colors.greenAccent.shade400,
+                              shape: BoxShape.circle,
+                              border: Border.all(color: Colors.white, width: 1.8),
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(width: 8),
+                  Flexible(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          displayName,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(color: Colors.black),
+                        ),
+                        if (presenceText != null)
+                          Text(
+                            presenceText,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              color: isOnline
+                                  ? Colors.green.shade700
+                                  : Colors.black54,
+                              fontSize: 11,
+                              fontWeight: isOnline
+                                  ? FontWeight.w600
+                                  : FontWeight.w400,
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ],
+              );
+            },
           ),
         ),
         iconTheme: const IconThemeData(color: Colors.black),
@@ -1016,7 +1114,6 @@ class _ChatScreenState extends State<ChatScreen> {
                               onChanged: (v) {
                                 _setTyping(v.isNotEmpty);
                                 _onDraftChanged(v);
-                                _pendingText = v;
                                 setState(() {});
                               },
                               decoration: const InputDecoration(

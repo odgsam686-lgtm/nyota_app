@@ -3,6 +3,7 @@ import 'package:nyota_app/widgets/nyota_background.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'chat_screen.dart';
 import 'package:nyota_app/pages/public_profile_page.dart';
+import 'package:nyota_app/pages/follow_activity_page.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 class ConversationsListScreen extends StatefulWidget {
@@ -21,6 +22,37 @@ class ConversationsListScreen extends StatefulWidget {
 class _ConversationsListScreenState extends State<ConversationsListScreen> {
   final Map<String, int> _localUnreadOverride = {};
   final Map<String, DateTime> _clearedAt = {};
+
+  Stream<List<Map<String, dynamic>>> _presenceStream(String userId) {
+    return Supabase.instance.client
+        .from('user_presence')
+        .stream(primaryKey: ['user_id'])
+        .eq('user_id', userId);
+  }
+
+  String _formatPresenceAgo(DateTime seenAt) {
+    final now = DateTime.now();
+    final diff = now.difference(seenAt.toLocal());
+    if (diff.inSeconds < 60) return 'à l’instant';
+    if (diff.inMinutes < 60) return 'il y a ${diff.inMinutes} min';
+    if (diff.inHours < 24) return 'il y a ${diff.inHours} h';
+    if (diff.inDays < 7) return 'il y a ${diff.inDays} j';
+    return 'il y a ${(diff.inDays / 7).floor()} sem';
+  }
+
+  ({String text, bool online})? _presenceInfoFromRow(Map<String, dynamic>? row) {
+    if (row == null) return null;
+    if (row['is_online'] == true) {
+      return (text: 'En ligne', online: true);
+    }
+    final raw = row['last_seen']?.toString() ?? row['updated_at']?.toString();
+    if (raw == null || raw.isEmpty) return null;
+    final parsed = DateTime.tryParse(raw);
+    if (parsed == null) return null;
+    return (text: 'Vu ${_formatPresenceAgo(parsed)}', online: false);
+  }
+
+  bool _presenceIsOnline(Map<String, dynamic>? row) => row?['is_online'] == true;
 
   /// 🔹 Récupérer display_name/username/avatar_url depuis public_profiles
   Future<Map<String, dynamic>?> fetchUserProfile(String userId) async {
@@ -102,6 +134,88 @@ class _ConversationsListScreenState extends State<ConversationsListScreen> {
     return null;
   }
 
+  Stream<List<Map<String, dynamic>>> _followNotificationsStream() {
+    return Supabase.instance.client
+        .from('app_notifications')
+        .stream(primaryKey: ['id'])
+        .eq('user_id', widget.currentUserId)
+        .order('created_at', ascending: false);
+  }
+
+  Widget _buildFollowHubTile(BuildContext context) {
+    return StreamBuilder<List<Map<String, dynamic>>>(
+      stream: _followNotificationsStream(),
+      builder: (context, snapshot) {
+        final rows = (snapshot.data ?? const <Map<String, dynamic>>[])
+            .where((r) => r['kind']?.toString() == 'follow')
+            .toList();
+        final unread = rows.where((r) => r['is_read'] != true).length;
+        return ListTile(
+          leading: Stack(
+            clipBehavior: Clip.none,
+            children: [
+              const CircleAvatar(
+                child: Icon(Icons.people_alt_outlined),
+              ),
+              Positioned(
+                right: -2,
+                bottom: -2,
+                child: Container(
+                  width: 14,
+                  height: 14,
+                  decoration: BoxDecoration(
+                    color: Colors.blueAccent,
+                    shape: BoxShape.circle,
+                    border: Border.all(color: Colors.white, width: 2),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          title: const Text(
+            'Suivis & suggestions',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+          subtitle: Text(
+            unread > 0
+                ? '$unread nouveau(x) suivi(s)'
+                : 'Abonnés, nouveaux suivis, suggestions',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+          trailing: unread > 0
+              ? Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  decoration: const BoxDecoration(
+                    color: Colors.green,
+                    shape: BoxShape.circle,
+                  ),
+                  child: Text(
+                    unread > 99 ? '99+' : unread.toString(),
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 11,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                )
+              : const Icon(Icons.chevron_right),
+          onTap: () {
+            Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (_) => FollowActivityPage(
+                  currentUserId: widget.currentUserId,
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final supabase = Supabase.instance.client;
@@ -140,18 +254,29 @@ class _ConversationsListScreenState extends State<ConversationsListScreen> {
 
             final conversations = snapshot.data!;
 
-            if (conversations.isEmpty) {
-              return const Center(
-                child: Text(
-                  "Aucune conversation",
-                  style: TextStyle(color: Colors.black),
-                ),
-              );
-            }
             return ListView.builder(
-              itemCount: conversations.length,
+              itemCount: conversations.length + 1,
               itemBuilder: (context, index) {
-                final convo = conversations[index];
+                if (index == 0) {
+                  return Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      _buildFollowHubTile(context),
+                      if (conversations.isEmpty)
+                        const Padding(
+                          padding: EdgeInsets.fromLTRB(16, 8, 16, 12),
+                          child: Align(
+                            alignment: Alignment.centerLeft,
+                            child: Text(
+                              "Aucune conversation",
+                              style: TextStyle(color: Colors.black54),
+                            ),
+                          ),
+                        ),
+                    ],
+                  );
+                }
+                final convo = conversations[index - 1];
 
                 final otherUserId = convo['user_a'] == widget.currentUserId
                     ? convo['user_b']
@@ -200,36 +325,98 @@ class _ConversationsListScreenState extends State<ConversationsListScreen> {
                             hasDraft ? "Brouillon : $draft" : (convo['last_message'] ?? '');
 
                         return ListTile(
-                          leading: Stack(
-                            children: [
-                              GestureDetector(
-                                onTap: () {
-                                  Navigator.push(
-                                    context,
-                                    MaterialPageRoute(
-                                      builder: (_) => PublicProfilePage(
-                                        sellerId:
-                                            otherUserId, // ✅ identité correcte
+                          leading: StreamBuilder<List<Map<String, dynamic>>>(
+                            stream: _presenceStream(otherUserId),
+                            builder: (context, presenceSnap) {
+                              final rows = presenceSnap.data;
+                              final row = (rows != null && rows.isNotEmpty)
+                                  ? rows.first
+                                  : null;
+                              final isOnline = _presenceIsOnline(row);
+                              return Stack(
+                                clipBehavior: Clip.none,
+                                children: [
+                                  GestureDetector(
+                                    onTap: () {
+                                      Navigator.push(
+                                        context,
+                                        MaterialPageRoute(
+                                          builder: (_) => PublicProfilePage(
+                                            sellerId: otherUserId,
+                                          ),
+                                        ),
+                                      );
+                                    },
+                                    child: CircleAvatar(
+                                      backgroundImage:
+                                          avatarUrl != null && avatarUrl.isNotEmpty
+                                              ? NetworkImage(avatarUrl)
+                                              : null,
+                                      child: avatarUrl == null || avatarUrl.isEmpty
+                                          ? const Icon(Icons.person)
+                                          : null,
+                                    ),
+                                  ),
+                                  if (isOnline)
+                                    Positioned(
+                                      right: -1,
+                                      bottom: -1,
+                                      child: Container(
+                                        width: 12,
+                                        height: 12,
+                                        decoration: BoxDecoration(
+                                          color: Colors.greenAccent.shade400,
+                                          shape: BoxShape.circle,
+                                          border: Border.all(
+                                            color: Colors.white,
+                                            width: 1.8,
+                                          ),
+                                        ),
                                       ),
                                     ),
-                                  );
-                                },
-                                child: CircleAvatar(
-                                  backgroundImage:
-                                      avatarUrl != null && avatarUrl.isNotEmpty
-                                          ? NetworkImage(avatarUrl)
-                                          : null,
-                                  child: avatarUrl == null || avatarUrl.isEmpty
-                                      ? const Icon(Icons.person)
-                                      : null,
-                                ),
-                              ),
-                            ],
+                                ],
+                              );
+                            },
                           ),
-                          title: Text(
-                            username,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
+                          title: StreamBuilder<List<Map<String, dynamic>>>(
+                            stream: _presenceStream(otherUserId),
+                            builder: (context, presenceSnap) {
+                              final rows = presenceSnap.data;
+                              final row = (rows != null && rows.isNotEmpty)
+                                  ? rows.first
+                                  : null;
+                              final info = _presenceInfoFromRow(row);
+                              return Row(
+                                children: [
+                                  Expanded(
+                                    child: Text(
+                                      username,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                  if (info != null) ...[
+                                    const SizedBox(width: 8),
+                                    Flexible(
+                                      child: Text(
+                                        info.text,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: TextStyle(
+                                          fontSize: 11,
+                                          color: info.online
+                                              ? Colors.green.shade700
+                                              : Colors.black54,
+                                          fontWeight: info.online
+                                              ? FontWeight.w600
+                                              : FontWeight.w400,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ],
+                              );
+                            },
                           ),
                           subtitle: Text(
                             subtitleText,
@@ -292,3 +479,4 @@ class _ConversationsListScreenState extends State<ConversationsListScreen> {
     );
   }
 }
+

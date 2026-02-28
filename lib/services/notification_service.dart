@@ -9,8 +9,8 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:http/http.dart' as http;
 
 import 'package:nyota_app/chat_screen.dart';
-import 'package:nyota_app/pages/public_profile_page.dart';
 import 'package:nyota_app/services/unread_counter_service.dart';
+import 'package:nyota_app/services/presence_service.dart';
 
 class NotificationService {
   NotificationService._();
@@ -19,7 +19,9 @@ class NotificationService {
 
   final FirebaseMessaging _messaging = FirebaseMessaging.instance;
   final SupabaseClient _supabase = Supabase.instance.client;
-  static const String _functionsBase = 'https://nyota.africa/functions/v1';
+  static const List<String> _functionsBases = <String>[
+    'https://uczycvteyfgdhfjeuglw.supabase.co/functions/v1',
+  ];
 
   GlobalKey<NavigatorState>? _navigatorKey;
   GlobalKey<ScaffoldMessengerState>? _messengerKey;
@@ -28,10 +30,14 @@ class NotificationService {
   String? _activeConversationId;
 
   StreamSubscription<List<Map<String, dynamic>>>? _messageStreamSub;
+  StreamSubscription<List<Map<String, dynamic>>>? _activityNotifStreamSub;
   StreamSubscription<String>? _tokenRefreshSub;
 
   final Set<String> _seenMessageIds = {};
+  final Set<String> _seenActivityNotificationIds = {};
   bool _streamInitialized = false;
+  bool _activityStreamInitialized = false;
+  bool _tapHandlersBound = false;
 
   void bind({
     required GlobalKey<NavigatorState> navigatorKey,
@@ -43,6 +49,7 @@ class NotificationService {
 
   void setActiveConversationId(String? conversationId) {
     _activeConversationId = conversationId;
+    PresenceService.instance.setActiveConversationId(conversationId);
   }
 
   Future<void> initForUser(String? userId) async {
@@ -59,6 +66,7 @@ class NotificationService {
     });
 
     _listenInAppMessages();
+    _listenInAppActivityNotifications();
     _handleNotificationTaps();
   }
 
@@ -74,20 +82,41 @@ class NotificationService {
         : Platform.isAndroid
             ? 'android'
             : 'web';
-    final res = await http.post(
-      Uri.parse('$_functionsBase/register-device'),
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer $idToken',
-      },
-      body: jsonEncode({
-        'user_id': uid,
-        'fcm_token': token,
-        'platform': platform,
-      }),
-    );
-    if (res.statusCode < 200 || res.statusCode >= 300) {
-      debugPrint('register-device failed: ${res.statusCode} ${res.body}');
+    http.Response? lastResponse;
+    Object? lastError;
+    for (final base in _functionsBases) {
+      try {
+        final res = await http.post(
+          Uri.parse('$base/register-device'),
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer $idToken',
+          },
+          body: jsonEncode({
+            'user_id': uid,
+            'fcm_token': token,
+            'platform': platform,
+          }),
+        );
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          debugPrint(
+            'register-device success user=$uid platform=$platform token=${token.substring(0, token.length > 12 ? 12 : token.length)}...',
+          );
+          return;
+        }
+        lastResponse = res;
+      } catch (e) {
+        lastError = e;
+      }
+    }
+    if (lastResponse != null) {
+      final body = lastResponse.body;
+      final preview = body.length > 300 ? '${body.substring(0, 300)}...' : body;
+      debugPrint(
+        'register-device failed: ${lastResponse.statusCode} $preview',
+      );
+    } else if (lastError != null) {
+      debugPrint('register-device failed: $lastError');
     }
   }
 
@@ -142,6 +171,48 @@ class NotificationService {
     });
   }
 
+  void _listenInAppActivityNotifications() {
+    final uid = _userId;
+    if (uid == null) return;
+
+    _activityNotifStreamSub?.cancel();
+    _activityNotifStreamSub = _supabase
+        .from('app_notifications')
+        .stream(primaryKey: ['id'])
+        .eq('user_id', uid)
+        .order('created_at', ascending: true)
+        .listen((rows) async {
+      if (!_activityStreamInitialized) {
+        for (final row in rows) {
+          final id = row['id']?.toString();
+          if (id != null) _seenActivityNotificationIds.add(id);
+        }
+        _activityStreamInitialized = true;
+        return;
+      }
+
+      for (final row in rows) {
+        final id = row['id']?.toString();
+        if (id == null || _seenActivityNotificationIds.contains(id)) continue;
+        _seenActivityNotificationIds.add(id);
+
+        final actorId = row['actor_id']?.toString();
+        if (actorId != null && actorId == uid) continue;
+
+        final actorName = await _fetchSenderName(actorId);
+        final body = _buildInteractionPreview(row, actorName: actorName);
+
+        _showInAppBanner(
+          title: 'Nyota Africa',
+          body: body,
+          onTap: () => _openActivityNotification(row),
+        );
+      }
+    }, onError: (e) {
+      debugPrint('activity notifications stream error: $e');
+    });
+  }
+
   Future<String> _fetchSenderName(String? senderId) async {
     if (senderId == null || senderId.isEmpty) return 'Nouveau message';
     final profile = await _supabase
@@ -165,6 +236,50 @@ class NotificationService {
     return 'Message';
   }
 
+  String _buildInteractionPreview(
+    Map<String, dynamic> row, {
+    required String actorName,
+  }) {
+    final kind = row['kind']?.toString() ?? '';
+    switch (kind) {
+      case 'follow':
+        return '$actorName a commencé à vous suivre';
+      case 'post_like':
+        return '$actorName a aimé votre publication';
+      case 'post_comment':
+        return '$actorName a commenté votre publication';
+      case 'comment_reply':
+        return '$actorName a répondu à votre commentaire';
+      case 'comment_like':
+        return '$actorName a aimé votre commentaire';
+      default:
+        return '$actorName a interagi avec vous';
+    }
+  }
+
+  void _openActivityNotification(Map<String, dynamic> row) {
+    final nav = _navigatorKey?.currentState;
+    if (nav == null) return;
+
+    final kind = row['kind']?.toString();
+    final postId = row['post_id']?.toString();
+    final actorId = row['actor_id']?.toString();
+
+    if (postId != null &&
+        postId.isNotEmpty &&
+        (kind == 'post_comment' ||
+            kind == 'comment_reply' ||
+            kind == 'post_like' ||
+            kind == 'comment_like')) {
+      nav.pushNamed('/comments', arguments: postId);
+      return;
+    }
+
+    if (actorId != null && actorId.isNotEmpty) {
+      nav.pushNamed('/publicProfile', arguments: actorId);
+    }
+  }
+
   void _showInAppBanner({
     required String title,
     required String body,
@@ -185,11 +300,15 @@ class NotificationService {
   }
 
   void _handleNotificationTaps() async {
+    if (_tapHandlersBound) return;
+    _tapHandlersBound = true;
     FirebaseMessaging.onMessageOpenedApp.listen((message) {
       final conversationId = message.data['conversationId']?.toString();
       if (conversationId != null) {
         openChatByConversationId(conversationId);
+        return;
       }
+      _handlePushInteractionTap(message.data);
     });
 
     final initial = await _messaging.getInitialMessage();
@@ -197,7 +316,29 @@ class NotificationService {
       final conversationId = initial.data['conversationId']?.toString();
       if (conversationId != null) {
         openChatByConversationId(conversationId);
+        return;
       }
+      _handlePushInteractionTap(initial.data);
+    }
+  }
+
+  void _handlePushInteractionTap(Map<String, dynamic> data) {
+    final kind = data['kind']?.toString();
+    final postId = data['postId']?.toString();
+    final actorId = data['actorId']?.toString();
+
+    if (kind == null || kind.isEmpty) return;
+    if (postId != null &&
+        postId.isNotEmpty &&
+        (kind == 'post_comment' ||
+            kind == 'comment_reply' ||
+            kind == 'post_like' ||
+            kind == 'comment_like')) {
+      _navigatorKey?.currentState?.pushNamed('/comments', arguments: postId);
+      return;
+    }
+    if (actorId != null && actorId.isNotEmpty) {
+      _navigatorKey?.currentState?.pushNamed('/publicProfile', arguments: actorId);
     }
   }
 
@@ -246,12 +387,17 @@ class NotificationService {
 
   void dispose() {
     _messageStreamSub?.cancel();
+    _activityNotifStreamSub?.cancel();
     _tokenRefreshSub?.cancel();
     _messageStreamSub = null;
+    _activityNotifStreamSub = null;
     _tokenRefreshSub = null;
     _userId = null;
     _activeConversationId = null;
     _seenMessageIds.clear();
+    _seenActivityNotificationIds.clear();
     _streamInitialized = false;
+    _activityStreamInitialized = false;
+    _tapHandlersBound = false;
   }
 }

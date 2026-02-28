@@ -21,6 +21,62 @@ class DraftPublishResult {
 
 /// Publishes a local draft to Supabase (no UI, no Hive).
 class DraftPublishService {
+  static Future<void> _copyUserLocationToPostLocation({
+    required SupabaseClient supabase,
+    required String firebaseUid,
+    required String postId,
+  }) async {
+    try {
+      final row = await supabase
+          .from('user_locations')
+          .select('latitude, longitude, zone')
+          .eq('user_id', firebaseUid)
+          .maybeSingle();
+
+      if (row == null) {
+        debugPrint(
+            'DraftPublishService post_locations skipped: no user_locations for user=$firebaseUid');
+        return;
+      }
+
+      double? toDouble(dynamic value) {
+        if (value is double) return value;
+        if (value is num) return value.toDouble();
+        return double.tryParse(value?.toString() ?? '');
+      }
+
+      final latitude = toDouble(row['latitude']);
+      final longitude = toDouble(row['longitude']);
+      final zone = row['zone']?.toString();
+
+      if (latitude == null || longitude == null) {
+        debugPrint(
+            'DraftPublishService post_locations skipped: invalid coordinates user=$firebaseUid row=$row');
+        return;
+      }
+
+      final payload = <String, dynamic>{
+        'post_id': postId,
+        'latitude': latitude,
+        'longitude': longitude,
+      };
+      if (zone != null && zone.trim().isNotEmpty) {
+        payload['zone'] = zone.trim();
+      }
+
+      await supabase.from('post_locations').upsert(
+            payload,
+            onConflict: 'post_id',
+          );
+
+      debugPrint(
+          'DraftPublishService post_locations upsert post=$postId lat=$latitude lng=$longitude zone=${payload['zone']}');
+    } catch (e) {
+      debugPrint(
+          'DraftPublishService post_locations error post=$postId user=$firebaseUid error=$e');
+    }
+  }
+
   /// Uploads media/thumbnail and inserts a post.
   static Future<DraftPublishResult> publishDraft(
     DraftLocalModel draft,
@@ -96,6 +152,13 @@ class DraftPublishService {
           await supabase.from('posts').insert(payload).select().single();
 
       final postId = insert['id']?.toString();
+      if (postId != null && postId.isNotEmpty) {
+        await _copyUserLocationToPostLocation(
+          supabase: supabase,
+          firebaseUid: user.uid,
+          postId: postId,
+        );
+      }
 
       return DraftPublishResult(success: true, postId: postId);
     } catch (e) {

@@ -17,7 +17,20 @@ import 'package:nyota_app/offline/local_thumbnail_service.dart';
 
 // --- CLASSIFICATION AUTO (reprise pour brouillon) ---
 const Map<String, List<String>> categoryKeywords = {
-  "Vêtements": [
+  "telephone": [
+    "phone",
+    "iphone",
+    "samsung",
+    "xiaomi",
+    "tecno",
+    "itel",
+    "huawei",
+    "android",
+    "chargeur",
+    "cable",
+    "coque",
+  ],
+  "vetements": [
     "shirt",
     "pants",
     "jean",
@@ -29,11 +42,33 @@ const Map<String, List<String>> categoryKeywords = {
     "chemise",
     "pantalon",
     "robe",
-    "chaussure"
+    "chaussure",
+    "sandale",
+    "basket",
   ],
-  "Téléphones": ["phone", "iphone", "samsung", "xiaomi", "tecno", "itel"],
-  "Accessoires": ["watch", "bracelet", "earbuds", "airpods", "montre"],
-  "Alimentation": [
+  "cosmetique": [
+    "parfum",
+    "creme",
+    "lotion",
+    "huile",
+    "maquillage",
+    "beaute",
+    "savon",
+  ],
+  "electromenager": [
+    "tv",
+    "laptop",
+    "speaker",
+    "pc",
+    "ordinateur",
+    "mixeur",
+    "ventilateur",
+    "frigo",
+    "refrigerateur",
+    "cuiseur",
+    "fer",
+  ],
+  "alimentation": [
     "food",
     "rice",
     "oil",
@@ -42,18 +77,28 @@ const Map<String, List<String>> categoryKeywords = {
     "boisson",
     "riz",
     "huile",
-    "lait"
+    "lait",
+    "sucre",
+    "farine",
   ],
-  "Électronique": ["tv", "laptop", "speaker", "pc", "ordinateur"],
-  "Autres": []
+  "accessoires": [
+    "watch",
+    "bracelet",
+    "earbuds",
+    "airpods",
+    "montre",
+    "lunette",
+    "bijou",
+  ],
 };
 
 String autoDetectCategory(String description) {
-  final text = description.toLowerCase();
+  final text = description.toLowerCase().trim();
+  if (text.isEmpty) return "divers";
   for (final entry in categoryKeywords.entries) {
     if (entry.value.any((kw) => text.contains(kw))) return entry.key;
   }
-  return "Autres";
+  return "divers";
 }
 
 /// Page pour créer / enregistrer en brouillon / publier une publication (image ou vidéo)
@@ -161,6 +206,61 @@ class _AddPostPageState extends State<AddPostPage>
       if (mounted) {
         setState(() => _pickingMedia = false);
       }
+    }
+  }
+
+  Future<void> _upsertPostLocationFromUserLocation({
+    required String postId,
+    required String firebaseUid,
+  }) async {
+    try {
+      final supabase = Supabase.instance.client;
+      final row = await supabase
+          .from('user_locations')
+          .select('latitude, longitude, zone')
+          .eq('user_id', firebaseUid)
+          .maybeSingle();
+
+      if (row == null) {
+        debugPrint(
+            'post_locations skipped: no user_locations row for user=$firebaseUid');
+        return;
+      }
+
+      double? toDouble(dynamic value) {
+        if (value is double) return value;
+        if (value is num) return value.toDouble();
+        return double.tryParse(value?.toString() ?? '');
+      }
+
+      final latitude = toDouble(row['latitude']);
+      final longitude = toDouble(row['longitude']);
+      final zone = row['zone']?.toString();
+
+      if (latitude == null || longitude == null) {
+        debugPrint(
+            'post_locations skipped: invalid lat/lng for user=$firebaseUid row=$row');
+        return;
+      }
+
+      final payload = <String, dynamic>{
+        'post_id': postId,
+        'latitude': latitude,
+        'longitude': longitude,
+      };
+      if (zone != null && zone.trim().isNotEmpty) {
+        payload['zone'] = zone.trim();
+      }
+
+      await supabase.from('post_locations').upsert(
+            payload,
+            onConflict: 'post_id',
+          );
+
+      debugPrint(
+          'post_locations upsert post=$postId lat=$latitude lng=$longitude zone=${payload['zone']}');
+    } catch (e) {
+      debugPrint('post_locations upsert error post=$postId user=$firebaseUid $e');
     }
   }
 
@@ -338,7 +438,7 @@ Future<void> _saveDraft() async {
   if (_selectedFile == null) return;
 
   setState(() => _loading = true);
-  debugPrint("draft upload start");
+  debugPrint("draft save local start");
 
   try {
     final user = FirebaseAuth.instance.currentUser;
@@ -368,7 +468,7 @@ Future<void> _saveDraft() async {
     );
 
     DraftLocalStore().upsert(draft);
-    debugPrint("draft upload done");
+    debugPrint("draft save local done");
 
     if (mounted) Navigator.pop(context, true);
   } catch (e) {
@@ -407,6 +507,12 @@ Future<void> _saveDraft() async {
     }).select().single();
 
     final String postId = postInsert['id'].toString();
+    debugPrint("post publish insert ok post_id=$postId");
+
+    await _upsertPostLocationFromUserLocation(
+      postId: postId,
+      firebaseUid: user.uid,
+    );
 
     print("UPLOAD bucket=posts start user=${user.uid} isVideo=$_isVideo");
     // 2️⃣ Upload média (SUPABASE GÈRE LE THUMBNAIL)
@@ -720,3 +826,4 @@ Widget _mediaChoiceButton({
     ),
   );
 }
+

@@ -1,10 +1,15 @@
+import 'dart:async';
+
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:video_player/video_player.dart';
 
 import '../services/supabase_products_service.dart';
+import '../services/crashlytics_logger.dart';
 import '../utils/media_resolver.dart';
-import 'product_detail_page.dart';
+import '../widgets/fullscreen_media_actions.dart';
+import 'comments_page.dart';
 
 class CatalogPage extends StatefulWidget {
   const CatalogPage({super.key});
@@ -15,17 +20,34 @@ class CatalogPage extends StatefulWidget {
 
 class _CatalogPageState extends State<CatalogPage> {
   final SupabaseProductsService svc = SupabaseProductsService();
+  static const int _catalogPageSize = 28;
+  static const double _loadMoreThresholdPx = 700;
 
   List<Map<String, dynamic>> categories = [];
   String selectedCategory = 'all';
+  List<Map<String, dynamic>> subcategories = [];
+  String selectedSubcategory = 'all';
   List<Map<String, dynamic>> products = [];
   bool loading = true;
+  bool _loadingMore = false;
+  bool _hasMore = true;
+  int _nextOffset = 0;
   int _productsRequestEpoch = 0;
+  final ScrollController _gridScrollController = ScrollController();
 
   @override
   void initState() {
     super.initState();
+    CrashlyticsLogger.log('catalogue:open');
+    _gridScrollController.addListener(_onGridScroll);
     _loadCategoriesAndProducts();
+  }
+
+  @override
+  void dispose() {
+    _gridScrollController.removeListener(_onGridScroll);
+    _gridScrollController.dispose();
+    super.dispose();
   }
 
   Future<void> _loadCategoriesAndProducts() async {
@@ -48,20 +70,76 @@ class _CatalogPageState extends State<CatalogPage> {
     setState(() {
       categories = normalized;
       selectedCategory = 'all';
+      subcategories = [];
+      selectedSubcategory = 'all';
     });
     await _loadProductsFor('all');
   }
 
-  Future<void> _loadProductsFor(String category) async {
+  void _onGridScroll() {
+    if (!_gridScrollController.hasClients) return;
+    if (loading || _loadingMore || !_hasMore) return;
+    final pos = _gridScrollController.position;
+    if (pos.extentAfter <= _loadMoreThresholdPx) {
+      unawaited(_loadMoreProducts());
+    }
+  }
+
+  Future<void> _loadSubcategoriesFor(String category, int requestEpoch) async {
+    if (category == 'all') {
+      if (!mounted || requestEpoch != _productsRequestEpoch) return;
+      setState(() {
+        subcategories = [];
+        selectedSubcategory = 'all';
+      });
+      return;
+    }
+    final rows = await svc.fetchSubcategories(category: category);
+    if (!mounted || requestEpoch != _productsRequestEpoch) return;
+    setState(() {
+      subcategories = rows;
+      final exists = rows.any(
+        (s) => (s['slug'] ?? '').toString() == selectedSubcategory,
+      );
+      if (!exists) {
+        selectedSubcategory = 'all';
+      }
+    });
+  }
+
+  Future<void> _loadProductsFor(
+    String category, {
+    String subcategory = 'all',
+  }) async {
+    CrashlyticsLogger.log(
+      'catalogue:load category=$category subcategory=$subcategory',
+    );
     final requestEpoch = ++_productsRequestEpoch;
+    _hasMore = true;
+    _nextOffset = 0;
+    _loadingMore = false;
     if (mounted) {
-      setState(() => loading = true);
+      setState(() {
+        loading = true;
+        selectedCategory = category;
+        selectedSubcategory = subcategory;
+      });
     }
 
+    unawaited(_loadSubcategoriesFor(category, requestEpoch));
+
     try {
+      final subcategoryFilter =
+          subcategory != 'all' ? subcategory : null;
+      final limit = subcategoryFilter == null ? _catalogPageSize : 120;
       final raw = category == 'all'
-          ? await svc.fetchAllProductsLite()
-          : await svc.fetchProductsByCategoryLite(category: category);
+          ? await svc.fetchAllProductsLite(limit: limit, offset: 0)
+          : await svc.fetchProductsByCategoryLite(
+              category: category,
+              subcategorySlug: subcategoryFilter,
+              limit: limit,
+              offset: 0,
+            );
       if (!mounted || requestEpoch != _productsRequestEpoch) return;
 
       final normalized = <Map<String, dynamic>>[];
@@ -94,24 +172,129 @@ class _CatalogPageState extends State<CatalogPage> {
       }
 
       if (!mounted || requestEpoch != _productsRequestEpoch) return;
+      _nextOffset = subcategoryFilter == null ? raw.length : 0;
+      _hasMore = subcategoryFilter == null && raw.length >= _catalogPageSize;
       setState(() {
         products = normalized;
-        selectedCategory = category;
         loading = false;
       });
 
-      _precacheProductImages(normalized);
+      if (_gridScrollController.hasClients) {
+        _gridScrollController.jumpTo(0);
+      } else {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (_gridScrollController.hasClients) {
+            _gridScrollController.jumpTo(0);
+          }
+        });
+      }
+
+      _precacheProductImages(normalized, maxItems: 20);
       _hydrateProductsMeta(ids, requestEpoch);
+      _hydrateCommentCounts(ids, requestEpoch);
     } catch (e) {
       debugPrint('Catalogue load error: $e');
+      unawaited(CrashlyticsLogger.recordNonFatal(
+        e,
+        StackTrace.current,
+        reason: 'catalogue_load',
+      ));
       if (!mounted || requestEpoch != _productsRequestEpoch) return;
       setState(() => loading = false);
     }
   }
 
-  void _precacheProductImages(List<Map<String, dynamic>> rows) {
+  Future<void> _loadMoreProducts() async {
+    if (loading || _loadingMore || !_hasMore) return;
+    if (selectedSubcategory != 'all') return;
+    final requestEpoch = _productsRequestEpoch;
+    final category = selectedCategory;
+
+    if (mounted) {
+      setState(() => _loadingMore = true);
+    } else {
+      _loadingMore = true;
+    }
+
+    try {
+      final raw = category == 'all'
+          ? await svc.fetchAllProductsLite(
+              limit: _catalogPageSize,
+              offset: _nextOffset,
+            )
+          : await svc.fetchProductsByCategoryLite(
+              category: category,
+              subcategorySlug: null,
+              limit: _catalogPageSize,
+              offset: _nextOffset,
+            );
+      if (!mounted || requestEpoch != _productsRequestEpoch) return;
+
+      final normalized = <Map<String, dynamic>>[];
+      final ids = <String>[];
+      final existingIds = products
+          .map((p) => p['id']?.toString() ?? '')
+          .where((id) => id.isNotEmpty)
+          .toSet();
+
+      for (final p in raw) {
+        final id = p['id']?.toString();
+        if (id == null || id.isEmpty || existingIds.contains(id)) continue;
+        normalized.add({
+          'id': id,
+          'seller_id': p['seller_id'],
+          'media_url': p['media_url'],
+          'media_type': p['media_type'],
+          'is_video': p['is_video'],
+          'video_variants': p['video_variants'],
+          'thumbnail_url': p['thumbnail_url'],
+          'thumbnail_path': p['thumbnail_path'],
+          'description': p['description'] ?? '',
+          'created_at': p['created_at'],
+          'seller_name': p['seller_name'] ?? 'Utilisateur',
+          'avatar_url': p['avatar_url'],
+          'likes': p['likes'] ?? 0,
+          'comments_count': p['comments_count'] ?? 0,
+          'price': p['price'],
+          'currency': p['currency'] ?? 'XOF',
+        });
+        ids.add(id);
+      }
+
+      _nextOffset += raw.length;
+      _hasMore = raw.length >= _catalogPageSize;
+
+      if (!mounted || requestEpoch != _productsRequestEpoch) return;
+      if (normalized.isNotEmpty) {
+        setState(() {
+          products = [...products, ...normalized];
+        });
+        _precacheProductImages(normalized, maxItems: 12);
+        _hydrateProductsMeta(ids, requestEpoch);
+        _hydrateCommentCounts(ids, requestEpoch);
+      }
+    } catch (e) {
+      debugPrint('Catalogue load more error: $e');
+      unawaited(CrashlyticsLogger.recordNonFatal(
+        e,
+        StackTrace.current,
+        reason: 'catalogue_load_more',
+      ));
+    } finally {
+      if (mounted && requestEpoch == _productsRequestEpoch) {
+        setState(() => _loadingMore = false);
+      } else {
+        _loadingMore = false;
+      }
+    }
+  }
+
+  void _precacheProductImages(
+    List<Map<String, dynamic>> rows, {
+    int maxItems = 20,
+  }) {
     if (!mounted) return;
-    for (final p in rows) {
+    for (final p in rows.take(maxItems)) {
       final isVideo = p['media_type'] == 'video' ||
           p['is_video'] == true ||
           p['is_video']?.toString() == 'true';
@@ -160,13 +343,34 @@ class _CatalogPageState extends State<CatalogPage> {
           p['seller_name'] = meta['seller_name'] ?? p['seller_name'];
           p['avatar_url'] = meta['avatar_url'];
           p['likes'] = meta['likes'] ?? p['likes'];
-          p['comments_count'] = meta['comments_count'] ?? p['comments_count'];
           p['price'] = meta['price'] ?? p['price'];
           p['currency'] = meta['currency'] ?? p['currency'];
         }
       });
     } catch (e) {
       debugPrint('Catalogue hydrate error: $e');
+      unawaited(CrashlyticsLogger.recordNonFatal(
+        e,
+        StackTrace.current,
+        reason: 'catalogue_hydrate_meta',
+      ));
+    }
+  }
+
+  Future<void> _hydrateCommentCounts(List<String> ids, int requestEpoch) async {
+    if (ids.isEmpty) return;
+    try {
+      final counts = await svc.fetchCommentCountsByPostIds(ids);
+      if (!mounted || requestEpoch != _productsRequestEpoch) return;
+      setState(() {
+        for (final p in products) {
+          final id = p['id']?.toString();
+          if (id == null || !ids.contains(id)) continue;
+          p['comments_count'] = counts[id] ?? 0;
+        }
+      });
+    } catch (e) {
+      debugPrint('Catalogue comments count hydrate error: $e');
     }
   }
 
@@ -213,6 +417,64 @@ class _CatalogPageState extends State<CatalogPage> {
               },
             ),
           ),
+          if (selectedCategory != 'all' && subcategories.isNotEmpty)
+            SizedBox(
+              height: 48,
+              child: ListView.separated(
+                scrollDirection: Axis.horizontal,
+                itemCount: subcategories.length + 1,
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                separatorBuilder: (_, __) => const SizedBox(width: 8),
+                itemBuilder: (context, i) {
+                  final bool isAll = i == 0;
+                  final sid = isAll
+                      ? 'all'
+                      : (subcategories[i - 1]['slug'] ?? '').toString();
+                  final label = isAll
+                      ? 'Tous'
+                      : (subcategories[i - 1]['label'] ??
+                              subcategories[i - 1]['slug'] ??
+                              '')
+                          .toString();
+                  final isSel = sid == selectedSubcategory;
+
+                  return GestureDetector(
+                    onTap: () => _loadProductsFor(
+                      selectedCategory,
+                      subcategory: sid,
+                    ),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 7,
+                      ),
+                      decoration: BoxDecoration(
+                        color:
+                            isSel ? Colors.deepPurple.shade400 : Colors.white,
+                        borderRadius: BorderRadius.circular(20),
+                        border: Border.all(
+                          color: isSel
+                              ? Colors.deepPurple.shade400
+                              : Colors.grey.shade300,
+                        ),
+                      ),
+                      child: Center(
+                        child: Text(
+                          label,
+                          style: TextStyle(
+                            color: isSel ? Colors.white : Colors.black87,
+                            fontSize: 12,
+                            fontWeight:
+                                isSel ? FontWeight.w600 : FontWeight.w400,
+                          ),
+                        ),
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
           Expanded(
             child: loading
                 ? const Center(child: CircularProgressIndicator())
@@ -221,6 +483,8 @@ class _CatalogPageState extends State<CatalogPage> {
                         child: Text('Aucun produit dans cette categorie'),
                       )
                     : GridView.builder(
+                        controller: _gridScrollController,
+                        cacheExtent: 900,
                         padding: const EdgeInsets.all(8),
                         gridDelegate:
                             const SliverGridDelegateWithFixedCrossAxisCount(
@@ -250,17 +514,22 @@ class _CatalogPageState extends State<CatalogPage> {
                           final title = (p['description'] ?? '').toString();
 
                           return GestureDetector(
+                            key: ValueKey('catalog_item_${p['id']}'),
                             onTap: () {
                               Navigator.push(
                                 context,
                                 MaterialPageRoute(
-                                  builder: (_) => ProductDetailPage(product: p),
+                                  builder: (_) => CatalogFullscreenFeedViewerPage(
+                                    products: products,
+                                    initialIndex: idx,
+                                  ),
                                 ),
                               );
                             },
                             child: ClipRRect(
                               borderRadius: BorderRadius.circular(8),
-                              child: GridTile(
+                              child: RepaintBoundary(
+                                child: GridTile(
                                 footer: Container(
                                   color: Colors.black54,
                                   padding: const EdgeInsets.symmetric(
@@ -277,6 +546,7 @@ class _CatalogPageState extends State<CatalogPage> {
                                 ),
                                 child: isVideo
                                     ? VideoPreviewTile(
+                                        key: ValueKey('catalog_video_${p['id']}'),
                                         mediaPath: media,
                                         variants: variants,
                                         thumbnailUrl: thumbnailUrl,
@@ -293,6 +563,7 @@ class _CatalogPageState extends State<CatalogPage> {
                                           child: const Icon(Icons.broken_image),
                                         ),
                                       ),
+                                ),
                               ),
                             ),
                           );
@@ -327,6 +598,7 @@ class _VideoPreviewTileState extends State<VideoPreviewTile> {
   bool _error = false;
   bool _loading = false;
   DateTime? _retryAfter;
+  int _initEpoch = 0;
 
   @override
   void initState() {
@@ -334,13 +606,49 @@ class _VideoPreviewTileState extends State<VideoPreviewTile> {
     _initController();
   }
 
+  @override
+  void didUpdateWidget(covariant VideoPreviewTile oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final sourceChanged = oldWidget.mediaPath != widget.mediaPath ||
+        oldWidget.thumbnailUrl != widget.thumbnailUrl;
+    if (!sourceChanged) return;
+
+    _initEpoch++;
+    _retryAfter = null;
+    _error = false;
+
+    if (widget.thumbnailUrl != null && widget.thumbnailUrl!.isNotEmpty) {
+      unawaited(_disposeController());
+      if (mounted) {
+        setState(() {
+          _ready = true;
+        });
+      } else {
+        _ready = true;
+      }
+      return;
+    }
+
+    unawaited(_disposeController());
+    if (mounted) {
+      setState(() {
+        _ready = false;
+      });
+    } else {
+      _ready = false;
+    }
+    unawaited(_initController(force: true));
+  }
+
   Future<void> _initController({bool force = false}) async {
-    if (_loading) return;
+    if (_loading && !force) return;
     if (!force &&
         _retryAfter != null &&
         DateTime.now().isBefore(_retryAfter!)) {
       return;
     }
+
+    final epoch = ++_initEpoch;
 
     if (mounted) {
       setState(() {
@@ -352,6 +660,8 @@ class _VideoPreviewTileState extends State<VideoPreviewTile> {
 
     try {
       if (widget.thumbnailUrl != null && widget.thumbnailUrl!.isNotEmpty) {
+        await _disposeController();
+        if (_initEpoch != epoch) return;
         if (!mounted) return;
         setState(() {
           _ready = true;
@@ -405,6 +715,10 @@ class _VideoPreviewTileState extends State<VideoPreviewTile> {
         throw lastError ?? Exception('Video source error');
       }
 
+      if (_initEpoch != epoch) {
+        await nextController.dispose();
+        return;
+      }
       if (!mounted) {
         await nextController.dispose();
         return;
@@ -425,27 +739,38 @@ class _VideoPreviewTileState extends State<VideoPreviewTile> {
       });
     } catch (e) {
       debugPrint('VideoPreviewTile error (${widget.mediaPath}): $e');
-      if (!mounted) return;
+      if (_initEpoch != epoch || !mounted) return;
       setState(() {
         _ready = true;
         _error = true;
         _retryAfter = DateTime.now().add(const Duration(seconds: 8));
       });
     } finally {
-      if (mounted) {
-        setState(() {
+      if (_initEpoch == epoch) {
+        if (mounted) {
+          setState(() {
+            _loading = false;
+          });
+        } else {
           _loading = false;
-        });
-      } else {
-        _loading = false;
+        }
       }
     }
   }
 
   @override
   void dispose() {
-    _controller?.dispose();
+    unawaited(_disposeController());
     super.dispose();
+  }
+
+  Future<void> _disposeController() async {
+    final c = _controller;
+    _controller = null;
+    if (c == null) return;
+    try {
+      await c.dispose();
+    } catch (_) {}
   }
 
   String _formatDuration(Duration d) {
@@ -557,6 +882,539 @@ class _VideoPreviewTileState extends State<VideoPreviewTile> {
           ),
         ),
       ],
+    );
+  }
+}
+
+class CatalogFullscreenFeedViewerPage extends StatefulWidget {
+  final List<Map<String, dynamic>> products;
+  final int initialIndex;
+
+  const CatalogFullscreenFeedViewerPage({
+    super.key,
+    required this.products,
+    required this.initialIndex,
+  });
+
+  @override
+  State<CatalogFullscreenFeedViewerPage> createState() =>
+      _CatalogFullscreenFeedViewerPageState();
+}
+
+class _CatalogFullscreenFeedViewerPageState
+    extends State<CatalogFullscreenFeedViewerPage> {
+  final SupabaseClient _supabase = Supabase.instance.client;
+  final Map<String, VideoPlayerController> _videoControllers = {};
+  final Map<String, int> _videoInitEpoch = {};
+  final Set<String> _videoInitInFlight = {};
+  final Set<String> _videoInitFailed = {};
+  final Map<String, DateTime> _videoRetryAfter = {};
+
+  late final PageController _pageController;
+  late int _currentIndex;
+
+  @override
+  void initState() {
+    super.initState();
+    _currentIndex = widget.products.isEmpty
+        ? 0
+        : widget.initialIndex.clamp(0, widget.products.length - 1);
+    _pageController = PageController(initialPage: _currentIndex);
+    unawaited(_maybeInitAroundIndex(_currentIndex));
+  }
+
+  @override
+  void dispose() {
+    _pageController.dispose();
+    for (final c in _videoControllers.values) {
+      try {
+        c.pause();
+        c.dispose();
+      } catch (_) {}
+    }
+    _videoControllers.clear();
+    _videoInitEpoch.clear();
+    _videoInitInFlight.clear();
+    _videoInitFailed.clear();
+    _videoRetryAfter.clear();
+    super.dispose();
+  }
+
+  bool _isVideo(Map<String, dynamic> doc) {
+    return doc['media_type'] == 'video' ||
+        doc['is_video'] == true ||
+        doc['is_video']?.toString() == 'true';
+  }
+
+  String _postIdForIndex(int index) {
+    if (index < 0 || index >= widget.products.length) return '';
+    return widget.products[index]['id']?.toString() ?? index.toString();
+  }
+
+  Future<void> _initializeVideoForIndex(int index) async {
+    if (index < 0 || index >= widget.products.length) return;
+    final doc = widget.products[index];
+    if (!_isVideo(doc)) return;
+
+    final mediaPath = doc['media_url']?.toString() ?? '';
+    if (mediaPath.isEmpty) return;
+    final postId = _postIdForIndex(index);
+    if (postId.isEmpty) return;
+    if (_videoControllers.containsKey(postId)) return;
+    if (_videoInitInFlight.contains(postId)) return;
+    final blockedUntil = _videoRetryAfter[postId];
+    if (blockedUntil != null && DateTime.now().isBefore(blockedUntil)) return;
+
+    final rawVariants = doc['video_variants'];
+    final variants = rawVariants is Map<String, dynamic>
+        ? rawVariants
+        : (rawVariants is Map ? Map<String, dynamic>.from(rawVariants) : null);
+
+    _videoInitInFlight.add(postId);
+    final epoch = DateTime.now().microsecondsSinceEpoch;
+    _videoInitEpoch[postId] = epoch;
+    debugPrint('catalog-fullscreen video:init post=$postId');
+
+    try {
+      final resolvedUrl = await resolveBestVideoUrl(
+        mediaPath: mediaPath,
+        variants: variants,
+      );
+      if (_videoInitEpoch[postId] != epoch) return;
+
+      final urls = <String>[resolvedUrl];
+      final fallbackUrl = resolveMediaUrl(mediaPath);
+      if (fallbackUrl.isNotEmpty && !urls.contains(fallbackUrl)) {
+        urls.add(fallbackUrl);
+      }
+
+      VideoPlayerController? controller;
+      Object? lastError;
+      for (final url in urls) {
+        VideoPlayerController? testController;
+        try {
+          testController = createVideoController(url);
+          await testController.initialize();
+          controller = testController;
+          break;
+        } catch (e) {
+          lastError = e;
+          try {
+            await testController?.dispose();
+          } catch (_) {}
+        }
+      }
+      if (controller == null) {
+        throw lastError ?? Exception('Video source error');
+      }
+      if (_videoInitEpoch[postId] != epoch) {
+        try {
+          await controller.dispose();
+        } catch (_) {}
+        return;
+      }
+
+      controller
+        ..setLooping(true)
+        ..setVolume(1.0);
+      _videoControllers[postId] = controller;
+      _videoInitFailed.remove(postId);
+      _videoRetryAfter.remove(postId);
+
+      if (_currentIndex == index) {
+        try {
+          await controller.play();
+        } catch (_) {}
+      } else {
+        try {
+          await controller.pause();
+        } catch (_) {}
+      }
+
+      if (mounted) setState(() {});
+    } catch (e) {
+      debugPrint('catalog-fullscreen video:error post=$postId error=$e');
+      _videoInitFailed.add(postId);
+      _videoRetryAfter[postId] = DateTime.now().add(const Duration(seconds: 8));
+      _videoControllers.remove(postId);
+    } finally {
+      _videoInitInFlight.remove(postId);
+    }
+  }
+
+  Future<void> _maybeInitAroundIndex(int index) async {
+    await _initializeVideoForIndex(index);
+    unawaited(_initializeVideoForIndex(index + 1));
+    unawaited(_initializeVideoForIndex(index - 1));
+    _pruneVideoControllers(index);
+  }
+
+  void _pruneVideoControllers(int centerIndex) {
+    final keep = <String>{};
+    for (final i in [centerIndex - 1, centerIndex, centerIndex + 1]) {
+      final id = _postIdForIndex(i);
+      if (id.isNotEmpty) keep.add(id);
+    }
+    final ids = _videoControllers.keys.toList();
+    for (final id in ids) {
+      if (keep.contains(id)) continue;
+      final c = _videoControllers.remove(id);
+      _videoInitEpoch.remove(id);
+      _videoInitInFlight.remove(id);
+      if (c != null) {
+        try {
+          c.pause();
+          c.dispose();
+        } catch (_) {}
+      }
+      debugPrint('catalog-fullscreen video:dispose post=$id');
+    }
+  }
+
+  void _pauseAllExcept(String? keepId) {
+    _videoControllers.forEach((id, c) {
+      if (id == keepId) return;
+      try {
+        if (c.value.isPlaying) c.pause();
+      } catch (_) {}
+    });
+  }
+
+  Future<void> _onPageChanged(int index) async {
+    _currentIndex = index;
+    final currentId = _postIdForIndex(index);
+    _pauseAllExcept(currentId);
+
+    final currentController = _videoControllers[currentId];
+    if (currentController != null && currentController.value.isInitialized) {
+      try {
+        await currentController.play();
+      } catch (_) {}
+    }
+
+    unawaited(_maybeInitAroundIndex(index));
+    if (mounted) setState(() {});
+  }
+
+  void _togglePlayPause(String postId) {
+    final ctrl = _videoControllers[postId];
+    if (ctrl == null || !ctrl.value.isInitialized) return;
+    try {
+      if (ctrl.value.isPlaying) {
+        ctrl.pause();
+      } else {
+        _pauseAllExcept(postId);
+        ctrl.play();
+      }
+      if (mounted) setState(() {});
+    } catch (_) {}
+  }
+
+  int _asInt(dynamic v) {
+    if (v is int) return v;
+    return int.tryParse(v?.toString() ?? '0') ?? 0;
+  }
+
+  Future<void> _openCommentsFor(Map<String, dynamic> post) async {
+    final postId = post['id']?.toString();
+    if (postId == null || postId.isEmpty) return;
+    await openComments(context, postId);
+    await _refreshCommentsCount(postId);
+  }
+
+  Future<void> _refreshCommentsCount(String postId) async {
+    try {
+      final rows = await _supabase.from('comments').select('id').eq('post_id', postId);
+      if (!mounted) return;
+      final count = rows.length;
+      for (final p in widget.products) {
+        if (p['id']?.toString() == postId) {
+          p['comments_count'] = count;
+          break;
+        }
+      }
+      setState(() {});
+    } catch (_) {}
+  }
+
+  void _openProfile(String? sellerId) {
+    if (sellerId == null || sellerId.isEmpty) return;
+    Navigator.of(context).pushNamed('/publicProfile', arguments: sellerId);
+  }
+
+  Widget _buildVideoFallback({
+    required String postId,
+    required String? thumbnailUrl,
+    required bool loading,
+    VoidCallback? onRetry,
+  }) {
+    final bg = (thumbnailUrl != null && thumbnailUrl.isNotEmpty)
+        ? CachedNetworkImage(
+            imageUrl: thumbnailUrl,
+            fit: BoxFit.cover,
+            width: double.infinity,
+            height: double.infinity,
+            placeholder: (c, s) => const SizedBox.shrink(),
+            errorWidget: (c, s, e) =>
+                const Center(child: Icon(Icons.broken_image, color: Colors.white70)),
+          )
+        : Container(color: Colors.black);
+
+    final ctrl = _videoControllers[postId];
+    final showPlayOverlay = ctrl == null || !ctrl.value.isPlaying;
+
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        bg,
+        if (loading)
+          const Center(
+            child: SizedBox(
+              width: 24,
+              height: 24,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            ),
+          ),
+        if (showPlayOverlay && !loading)
+          const Center(
+            child: Icon(
+              Icons.play_circle_fill,
+              size: 54,
+              color: Colors.white70,
+            ),
+          ),
+        if (onRetry != null)
+          Center(
+            child: ElevatedButton.icon(
+              onPressed: onRetry,
+              icon: const Icon(Icons.refresh, size: 16),
+              label: const Text('Reessayer'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.black87,
+                foregroundColor: Colors.white,
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildFullscreenVideo(
+    String postId,
+    String mediaPath,
+    String? thumbnailUrl,
+  ) {
+    final controller = _videoControllers[postId];
+    if (controller == null) {
+      final isFailed = _videoInitFailed.contains(postId);
+      return _buildVideoFallback(
+        postId: postId,
+        thumbnailUrl: thumbnailUrl,
+        loading: !isFailed,
+        onRetry: isFailed ? () => _retryVideoInit(postId) : null,
+      );
+    }
+
+    if (!controller.value.isInitialized || controller.value.hasError) {
+      return _buildVideoFallback(
+        postId: postId,
+        thumbnailUrl: thumbnailUrl,
+        loading: !controller.value.hasError,
+        onRetry:
+            controller.value.hasError ? () => _retryVideoInit(postId) : null,
+      );
+    }
+
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        FittedBox(
+          fit: BoxFit.cover,
+          clipBehavior: Clip.hardEdge,
+          child: SizedBox(
+            width: controller.value.size.width,
+            height: controller.value.size.height,
+            child: VideoPlayer(controller),
+          ),
+        ),
+        if (!controller.value.isPlaying)
+          const Center(
+            child: Icon(
+              Icons.play_circle_fill,
+              size: 54,
+              color: Colors.white70,
+            ),
+          ),
+      ],
+    );
+  }
+
+  void _retryVideoInit(String postId) {
+    _videoInitFailed.remove(postId);
+    _videoRetryAfter.remove(postId);
+    _videoInitEpoch.remove(postId);
+    final idx = widget.products.indexWhere((p) => p['id']?.toString() == postId);
+    if (idx >= 0) {
+      unawaited(_initializeVideoForIndex(idx));
+      if (mounted) setState(() {});
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (widget.products.isEmpty) {
+      return const Scaffold(
+        backgroundColor: Colors.black,
+        body: Center(
+          child: Text(
+            'Aucun média',
+            style: TextStyle(color: Colors.white),
+          ),
+        ),
+      );
+    }
+
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: SafeArea(
+        child: Stack(
+          children: [
+            PageView.builder(
+              controller: _pageController,
+              scrollDirection: Axis.vertical,
+              pageSnapping: true,
+              physics: const PageScrollPhysics(),
+              itemCount: widget.products.length,
+              onPageChanged: (index) {
+                unawaited(_onPageChanged(index));
+              },
+              itemBuilder: (context, index) {
+                final doc = widget.products[index];
+                final postId = _postIdForIndex(index);
+                final sellerId = doc['seller_id']?.toString() ?? '';
+                final rawMedia = doc['media_url']?.toString() ?? '';
+                final mediaUrl = rawMedia.isEmpty ? '' : resolveMediaUrl(rawMedia);
+                final rawThumb = doc['thumbnail_url'] ?? doc['thumbnail_path'];
+                final thumbnailUrl =
+                    rawThumb != null && rawThumb.toString().isNotEmpty
+                        ? resolveMediaUrl(rawThumb.toString())
+                        : null;
+                final isVideo = _isVideo(doc);
+                final title = (doc['description'] ?? '').toString();
+                final price = doc['price']?.toString() ?? '';
+                final currency = (doc['currency'] ?? 'XOF').toString();
+                final likesCount = _asInt(doc['likes']);
+                final commentsCount = _asInt(doc['comments_count']);
+
+                return GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: () {
+                    if (isVideo && postId.isNotEmpty) {
+                      _togglePlayPause(postId);
+                    }
+                  },
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      if (isVideo && rawMedia.isNotEmpty)
+                        _buildFullscreenVideo(postId, rawMedia, thumbnailUrl)
+                      else if (mediaUrl.isNotEmpty)
+                        CachedNetworkImage(
+                          imageUrl: mediaUrl,
+                          fit: BoxFit.cover,
+                          width: double.infinity,
+                          height: double.infinity,
+                          placeholder: (_, __) => thumbnailUrl != null
+                              ? CachedNetworkImage(
+                                  imageUrl: thumbnailUrl,
+                                  fit: BoxFit.cover,
+                                )
+                              : const Center(
+                                  child: CircularProgressIndicator(strokeWidth: 2),
+                                ),
+                          errorWidget: (_, __, ___) => const Center(
+                            child: Icon(Icons.broken_image, color: Colors.white70),
+                          ),
+                        )
+                      else
+                        Container(color: Colors.black54),
+                      Positioned(
+                        left: 0,
+                        right: 0,
+                        bottom: 0,
+                        height: 260,
+                        child: Container(
+                          decoration: const BoxDecoration(
+                            gradient: LinearGradient(
+                              colors: [Colors.transparent, Colors.black87],
+                              begin: Alignment.topCenter,
+                              end: Alignment.bottomCenter,
+                            ),
+                          ),
+                        ),
+                      ),
+                      Positioned(
+                        left: 16,
+                        bottom: 36,
+                        right: 88,
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            if (title.isNotEmpty)
+                              Text(
+                                title,
+                                maxLines: 3,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 15,
+                                ),
+                              ),
+                            if (price.isNotEmpty) ...[
+                              const SizedBox(height: 8),
+                              Text(
+                                '$price $currency',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ],
+                          ],
+                        ),
+                      ),
+                      FullScreenMediaActions(
+                        postId: postId,
+                        sellerId: sellerId,
+                        avatarUrl: doc['avatar_url']?.toString(),
+                        likesCount: likesCount,
+                        commentsCount: commentsCount,
+                        isLiked: false,
+                        onLike: () {},
+                        onComment: () => _openCommentsFor(doc),
+                        onOpenProfile: () => _openProfile(sellerId),
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+            Positioned(
+              left: 8,
+              top: 8,
+              child: CircleAvatar(
+                backgroundColor: Colors.black54,
+                child: IconButton(
+                  icon: const Icon(Icons.arrow_back, color: Colors.white),
+                  onPressed: () => Navigator.pop(context),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }

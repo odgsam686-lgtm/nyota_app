@@ -102,15 +102,31 @@ class SupabaseProductsService {
     return List<Map<String, dynamic>>.from(res);
   }
 
-  Future<List<Map<String, dynamic>>> fetchAllProductsLite() async {
-    final res = await supabase
-        .from('posts')
-        .select(
-            'id, seller_id, media_url, media_type, is_video, video_variants, '
-            'thumbnail_url, thumbnail_path, description, created_at')
-        .order('created_at', ascending: false);
-
-    return List<Map<String, dynamic>>.from(res);
+  Future<List<Map<String, dynamic>>> fetchAllProductsLite({
+    int? limit,
+    int offset = 0,
+  }) async {
+    const liteSelect =
+        'id, seller_id, media_url, media_type, is_video, video_variants, '
+        'thumbnail_url, thumbnail_path, description, created_at, category';
+    try {
+      return await _fetchRankedPostsSlice(
+        category: null,
+        subcategorySlug: null,
+        postSelect: liteSelect,
+        limit: limit,
+        offset: offset,
+      );
+    } catch (e) {
+      debugPrint("fetchAllProductsLite ranked fallback: $e");
+      final query = supabase.from('posts').select(liteSelect);
+      query.order('created_at', ascending: false);
+      if (limit != null && limit > 0) {
+        query.range(offset, offset + limit - 1);
+      }
+      final res = await query;
+      return List<Map<String, dynamic>>.from(res);
+    }
   }
 
   // ==========================================
@@ -191,20 +207,24 @@ class SupabaseProductsService {
   Future<List<Map<String, dynamic>>> fetchProductsByCategory({
     required String category,
     bool newestFirst = true,
+    String? subcategorySlug,
   }) async {
     try {
+      final ordered = await _fetchRankedPostsSlice(
+        category: category,
+        subcategorySlug: subcategorySlug,
+        postSelect:
+            'id, seller_id, seller_name, description, media_url, media_type, '
+            'thumbnail_url, category, price, currency, created_at, likes',
+      );
+      if (ordered.isNotEmpty) return ordered;
+
       final query = supabase.from('posts').select(
-            'id, seller_id, seller_name, description, '
-            'media_url, media_type, thumbnail_url, '
-            'category, price, currency, created_at, likes',
+            'id, seller_id, seller_name, description, media_url, media_type, '
+            'thumbnail_url, category, price, currency, created_at, likes',
           );
-
-      if (category != 'all') {
-        query.eq('category', category);
-      }
-
+      if (category != 'all') query.eq('category', category);
       query.order('created_at', ascending: !newestFirst);
-
       final raw = await query;
       return List<Map<String, dynamic>>.from(raw);
     } catch (e) {
@@ -216,19 +236,29 @@ class SupabaseProductsService {
   Future<List<Map<String, dynamic>>> fetchProductsByCategoryLite({
     required String category,
     bool newestFirst = true,
+    int? limit,
+    int offset = 0,
+    String? subcategorySlug,
   }) async {
     try {
-      final query = supabase.from('posts').select(
-            'id, seller_id, media_url, media_type, is_video, video_variants, '
-            'thumbnail_url, thumbnail_path, description, created_at',
-          );
+      const liteSelect =
+          'id, seller_id, media_url, media_type, is_video, video_variants, '
+          'thumbnail_url, thumbnail_path, description, created_at, category';
+      final ordered = await _fetchRankedPostsSlice(
+        category: category,
+        subcategorySlug: subcategorySlug,
+        postSelect: liteSelect,
+        limit: limit,
+        offset: offset,
+      );
+      if (ordered.isNotEmpty) return ordered;
 
-      if (category != 'all') {
-        query.eq('category', category);
-      }
-
+      final query = supabase.from('posts').select(liteSelect);
+      if (category != 'all') query.eq('category', category);
       query.order('created_at', ascending: !newestFirst);
-
+      if (limit != null && limit > 0) {
+        query.range(offset, offset + limit - 1);
+      }
       final raw = await query;
       return List<Map<String, dynamic>>.from(raw);
     } catch (e) {
@@ -244,8 +274,7 @@ class SupabaseProductsService {
     try {
       final raw = await supabase
           .from('posts')
-          .select(
-              'id, seller_name, avatar_url, likes, comments_count, price, currency')
+          .select('id, seller_name, avatar_url, likes, price, currency')
           .inFilter('id', ids);
       return List<Map<String, dynamic>>.from(raw);
     } catch (e) {
@@ -254,16 +283,55 @@ class SupabaseProductsService {
     }
   }
 
+  Future<Map<String, int>> fetchCommentCountsByPostIds(List<String> ids) async {
+    if (ids.isEmpty) return <String, int>{};
+    try {
+      final raw = await supabase
+          .from('comments')
+          .select('post_id')
+          .inFilter('post_id', ids);
+      final counts = <String, int>{};
+      for (final row in raw) {
+        final postId = (row['post_id'] ?? '').toString();
+        if (postId.isEmpty) continue;
+        counts[postId] = (counts[postId] ?? 0) + 1;
+      }
+      return counts;
+    } catch (e) {
+      debugPrint("fetchCommentCountsByPostIds error: $e");
+      return <String, int>{};
+    }
+  }
+
   // ==========================================
   // 🔥 FETCH CATÉGORIES
   // ==========================================
   Future<List<Map<String, dynamic>>> fetchCategories() async {
     try {
-      final raw = await supabase.from('categories').select('slug,label');
-      return [
-        {'slug': 'all', 'label': 'Tous les produits'},
-        ...raw,
-      ];
+      final ranked = await supabase
+          .from('catalogue_ranked_posts_mv')
+          .select('category');
+      final counts = <String, int>{};
+      for (final row in ranked) {
+        final rawCategory = (row['category'] ?? '').toString().trim();
+        if (rawCategory.isEmpty) continue;
+        counts[rawCategory] = (counts[rawCategory] ?? 0) + 1;
+      }
+
+      if (counts.isNotEmpty) {
+        final sorted = counts.entries.toList()
+          ..sort((a, b) => b.value.compareTo(a.value));
+        return [
+          {'slug': 'all', 'label': 'Tous les produits'},
+          ...sorted.map((e) {
+            final slug = e.key;
+            return {
+              'slug': slug,
+              'label': categoryLabels[slug] ?? _humanizeCategory(slug),
+            };
+          }),
+        ];
+      }
     } catch (_) {}
 
     return [
@@ -273,6 +341,219 @@ class SupabaseProductsService {
             'label': categoryLabels[k] ?? k,
           })
     ];
+  }
+
+  Future<List<Map<String, dynamic>>> fetchSubcategories({
+    required String category,
+    int limit = 20,
+  }) async {
+    if (category == 'all') return [];
+    try {
+      final raw = await supabase
+          .from('catalog_subcategories')
+          .select('category, slug, label, confidence, posts_count')
+          .eq('is_active', true)
+          .eq('category', category)
+          .order('confidence', ascending: false)
+          .order('posts_count', ascending: false)
+          .limit(limit);
+      return List<Map<String, dynamic>>.from(raw);
+    } catch (e) {
+      debugPrint("fetchSubcategories error: $e");
+      return [];
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> _fetchRankedPostsSlice({
+    required String? category,
+    required String? subcategorySlug,
+    required String postSelect,
+    int? limit,
+    int offset = 0,
+  }) async {
+    dynamic query = supabase
+        .from('catalogue_ranked_posts_mv')
+        .select('post_id, category, total_score, jitter');
+
+    if (category != null && category != 'all') {
+      query = query.eq('category', category);
+    }
+
+    query = query
+        .order('total_score', ascending: false)
+        .order('jitter', ascending: false)
+        .order('post_id', ascending: false);
+
+    if (limit != null && limit > 0) {
+      query = query.range(offset, offset + limit - 1);
+    }
+
+    final rankedRaw = await query;
+    var rankedRows = List<Map<String, dynamic>>.from(rankedRaw);
+    if (rankedRows.isEmpty) return [];
+
+    var postIds = rankedRows
+        .map((r) => r['post_id']?.toString() ?? '')
+        .where((id) => id.isNotEmpty)
+        .toList();
+    if (postIds.isEmpty) return [];
+
+    final hasSubcategory = subcategorySlug != null &&
+        subcategorySlug.trim().isNotEmpty &&
+        subcategorySlug != 'all' &&
+        category != null &&
+        category != 'all';
+
+    bool usedSqlSubcategoryFilter = false;
+    if (hasSubcategory) {
+      final cat = category;
+      final sub = subcategorySlug;
+      final sqlMatched = await _tryFetchSubcategoryPostIdsSql(
+        category: cat,
+        subcategorySlug: sub,
+        rankedPostIds: postIds,
+      );
+      if (sqlMatched != null) {
+        usedSqlSubcategoryFilter = true;
+        rankedRows = rankedRows.where((r) {
+          final id = r['post_id']?.toString() ?? '';
+          return id.isNotEmpty && sqlMatched.contains(id);
+        }).toList();
+        postIds = rankedRows
+            .map((r) => r['post_id']?.toString() ?? '')
+            .where((id) => id.isNotEmpty)
+            .toList();
+        if (postIds.isEmpty) return [];
+      }
+    }
+
+    final postRaw = await supabase
+        .from('posts')
+        .select(postSelect)
+        .inFilter('id', postIds);
+    final postRows = List<Map<String, dynamic>>.from(postRaw);
+    if (postRows.isEmpty) return [];
+
+    final byId = <String, Map<String, dynamic>>{};
+    for (final row in postRows) {
+      final id = row['id']?.toString();
+      if (id == null || id.isEmpty) continue;
+      byId[id] = row;
+    }
+
+    final ordered = <Map<String, dynamic>>[];
+    for (final r in rankedRows) {
+      final id = r['post_id']?.toString() ?? '';
+      final post = byId[id];
+      if (post == null) continue;
+      post['category'] = (post['category'] ?? r['category']);
+      post['catalog_total_score'] = r['total_score'];
+      post['catalog_jitter'] = r['jitter'];
+      ordered.add(post);
+    }
+    if (subcategorySlug == null ||
+        subcategorySlug.trim().isEmpty ||
+        subcategorySlug == 'all' ||
+        usedSqlSubcategoryFilter) {
+      return ordered;
+    }
+    return ordered
+        .where((p) => _matchesSubcategory(p, subcategorySlug))
+        .toList();
+  }
+
+  Future<Set<String>?> _tryFetchSubcategoryPostIdsSql({
+    required String category,
+    required String subcategorySlug,
+    required List<String> rankedPostIds,
+  }) async {
+    if (rankedPostIds.isEmpty) return <String>{};
+    try {
+      final raw = await supabase
+          .from('catalog_post_subcategories')
+          .select('post_id')
+          .eq('category', category)
+          .eq('slug', subcategorySlug)
+          .inFilter('post_id', rankedPostIds);
+      final ids = <String>{};
+      for (final row in raw) {
+        final id = (row['post_id'] ?? '').toString();
+        if (id.isNotEmpty) ids.add(id);
+      }
+      return ids;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  String _humanizeCategory(String slug) {
+    final normalized = slug.trim().toLowerCase();
+    if (normalized.isEmpty) return 'Divers';
+    return normalized
+        .replaceAll('_', ' ')
+        .split(' ')
+        .where((w) => w.isNotEmpty)
+        .map((w) => w[0].toUpperCase() + w.substring(1))
+        .join(' ');
+  }
+
+  bool _matchesSubcategory(Map<String, dynamic> post, String subcategorySlug) {
+    final text = _normalizeText(post['description']?.toString() ?? '');
+    if (text.isEmpty) return false;
+
+    final normalizedSlug = _normalizeText(
+      subcategorySlug.replaceAll('_', ' ').replaceAll('-', ' '),
+    );
+    if (normalizedSlug.isEmpty) return false;
+
+    if (text.contains(normalizedSlug)) return true;
+
+    final tokens = normalizedSlug
+        .split(RegExp(r'\s+'))
+        .where((t) => t.trim().length >= 3)
+        .toList();
+    if (tokens.isEmpty) return false;
+    for (final token in tokens) {
+      if (text.contains(token)) return true;
+    }
+    return false;
+  }
+
+  String _normalizeText(String input) {
+    var s = input.toLowerCase();
+    const replacements = {
+      'à': 'a',
+      'á': 'a',
+      'â': 'a',
+      'ä': 'a',
+      'ã': 'a',
+      'å': 'a',
+      'ç': 'c',
+      'è': 'e',
+      'é': 'e',
+      'ê': 'e',
+      'ë': 'e',
+      'ì': 'i',
+      'í': 'i',
+      'î': 'i',
+      'ï': 'i',
+      'ñ': 'n',
+      'ò': 'o',
+      'ó': 'o',
+      'ô': 'o',
+      'ö': 'o',
+      'õ': 'o',
+      'ù': 'u',
+      'ú': 'u',
+      'û': 'u',
+      'ü': 'u',
+      'ý': 'y',
+      'ÿ': 'y',
+    };
+    replacements.forEach((k, v) {
+      s = s.replaceAll(k, v);
+    });
+    return s;
   }
 }
 

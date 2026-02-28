@@ -4,15 +4,23 @@ import 'dart:async';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:nyota_app/widgets/nyota_background.dart';
 import 'package:video_player/video_player.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../widgets/fullscreen_media_actions.dart';
 import '../utils/media_resolver.dart';
+import '../services/feed_controller.dart';
+import '../services/crashlytics_logger.dart';
 import 'comments_page.dart';
 
 class FeedPage extends StatefulWidget {
-  const FeedPage({super.key});
+  final bool isVisible;
+
+  const FeedPage({
+    super.key,
+    this.isVisible = true,
+  });
 
   @override
   State<FeedPage> createState() => _FeedPageState();
@@ -27,6 +35,19 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
   bool isLoading = false;
   bool hasMore = true;
   final int limit = 6; // ajustable
+  final FeedController _feedController = FeedController();
+  final Set<String> _loadedFeedPostIds = <String>{};
+  final Set<String> _impressionMarkedPostIds = <String>{};
+  String? _viewerDbUserId;
+  String? _viewerDbUserIdForFirebaseUid;
+  Future<String?>? _viewerDbUserIdFuture;
+  StreamSubscription<Position>? _userLocationSub;
+  DateTime? _lastUserLocationSyncAt;
+  double? _lastUserLocationLat;
+  double? _lastUserLocationLng;
+  bool _userLocationSyncInFlight = false;
+  static const Duration _inactiveRefreshThreshold = Duration(minutes: 5);
+  static DateTime? _lastFeedInactiveAt;
 
   // Video controllers keyed by postId (stabler que par index)
   final Map<String, VideoPlayerController> videoControllers = {};
@@ -40,6 +61,8 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
   String? _pendingViewPostId;
   final Set<String> _viewRegisteredPosts = {};
   final Set<String> _viewInFlightPosts = {};
+  RealtimeChannel? _commentsChannel;
+  Timer? _commentsRefreshDebounce;
 
   // Pour animation like
   final Set<String> likedLocal = {}; // posts liked locally (UI)
@@ -47,22 +70,55 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
   final supabase = Supabase.instance.client;
   String? _doubleTapPostId;
   bool _showBigHeart = false;
+  bool _didInitialFeedLoad = false;
 
   @override
   void initState() {
     super.initState();
+    CrashlyticsLogger.log('feed:open');
     WidgetsBinding.instance.addObserver(this);
-    _loadMorePosts();
-    // ... ton code existant ...
+    _initCommentsRealtime();
+    if (widget.isVisible) {
+      _maybeRefreshAfterInactivity(forceIfEmpty: true);
+      _startUserLocationTracking();
+      _syncUserLocationOnce();
+    }
     FirebaseAuth.instance.authStateChanges().listen((user) {
-      // quand le user change, reload likes (et posts si besoin)
+      if (!mounted) return;
+      _handleAuthChanged();
       _loadLikesForPosts();
     });
   }
 
   @override
+  void didUpdateWidget(covariant FeedPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.isVisible == widget.isVisible) return;
+
+    if (!widget.isVisible) {
+      _markFeedInactive();
+      _cancelViewTimer();
+      _pauseAllVideos();
+      _stopUserLocationTracking();
+      return;
+    }
+
+    _maybeRefreshAfterInactivity(forceIfEmpty: posts.isEmpty);
+    _startUserLocationTracking();
+    _syncUserLocationOnce();
+    _playCurrentIfNeeded();
+  }
+
+  @override
   void dispose() {
+    _markFeedInactive();
     _cancelViewTimer();
+    _commentsRefreshDebounce?.cancel();
+    if (_commentsChannel != null) {
+      supabase.removeChannel(_commentsChannel!);
+      _commentsChannel = null;
+    }
+    _stopUserLocationTracking();
     WidgetsBinding.instance.removeObserver(this);
     _pageController.dispose();
     for (var c in videoControllers.values) {
@@ -76,6 +132,7 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
     _videoInitInFlight.clear();
     _videoInitFailed.clear();
     _videoRetryAfter.clear();
+    _feedController.dispose();
     super.dispose();
   }
 
@@ -83,105 +140,436 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.inactive) {
+      _markFeedInactive();
       _cancelViewTimer();
       _pauseAllVideos();
+      _stopUserLocationTracking();
     } else if (state == AppLifecycleState.resumed) {
-      _playCurrentIfNeeded();
+      if (widget.isVisible) {
+        _maybeRefreshAfterInactivity();
+        _startUserLocationTracking();
+        _syncUserLocationOnce(forceCurrent: true);
+        _playCurrentIfNeeded();
+      }
+    }
+  }
+
+  @override
+  void deactivate() {
+    _markFeedInactive();
+    _stopUserLocationTracking();
+    super.deactivate();
+  }
+
+  @override
+  void activate() {
+    super.activate();
+    if (widget.isVisible) {
+      _startUserLocationTracking();
+      _syncUserLocationOnce();
+      _maybeRefreshAfterInactivity();
+    }
+  }
+
+  void _handleAuthChanged() {
+    _viewerDbUserId = null;
+    _viewerDbUserIdForFirebaseUid = null;
+    _viewerDbUserIdFuture = null;
+    _resolveViewerDbUserId();
+    if (widget.isVisible) {
+      _syncUserLocationOnce(forceCurrent: true);
+    }
+    _resetFeedStateForReload();
+    if (widget.isVisible) {
+      _loadMorePosts();
+    }
+  }
+
+  void _initCommentsRealtime() {
+    _commentsChannel = supabase.channel('feed-comments-counts');
+    _commentsChannel!
+        .onPostgresChanges(
+          event: PostgresChangeEvent.all,
+          schema: 'public',
+          table: 'comments',
+          callback: (payload) {
+            final postId =
+                (payload.newRecord['post_id'] ?? payload.oldRecord['post_id'] ?? '')
+                    .toString();
+            if (postId.isEmpty) return;
+            if (!posts.any((p) => p['id']?.toString() == postId)) return;
+            _scheduleRefreshCommentCounts();
+          },
+        )
+        .subscribe();
+  }
+
+  void _scheduleRefreshCommentCounts() {
+    _commentsRefreshDebounce?.cancel();
+    _commentsRefreshDebounce = Timer(
+      const Duration(milliseconds: 220),
+      () => unawaited(_loadCommentCountsForPosts()),
+    );
+  }
+
+  Future<void> _loadCommentCountsForPosts({List<String>? onlyPostIds}) async {
+    final ids = (onlyPostIds ??
+            posts.map((p) => p['id']?.toString() ?? '').toList())
+        .where((id) => id.isNotEmpty)
+        .toSet()
+        .toList();
+    if (ids.isEmpty) return;
+
+    try {
+      final rows = await supabase
+          .from('comments')
+          .select('post_id')
+          .inFilter('post_id', ids);
+      if (!mounted) return;
+
+      final counts = <String, int>{};
+      for (final row in rows) {
+        final pid = (row['post_id'] ?? '').toString();
+        if (pid.isEmpty) continue;
+        counts[pid] = (counts[pid] ?? 0) + 1;
+      }
+
+      setState(() {
+        for (final p in posts) {
+          final id = p['id']?.toString();
+          if (id == null || !ids.contains(id)) continue;
+          p['comments_count'] = counts[id] ?? 0;
+        }
+      });
+    } catch (e) {
+      debugPrint('Erreur load comments counts: $e');
+    }
+  }
+
+  void _stopUserLocationTracking() {
+    _userLocationSub?.cancel();
+    _userLocationSub = null;
+  }
+
+  void _startUserLocationTracking() {
+    if (_userLocationSub != null) return;
+
+    final settings = const LocationSettings(
+      accuracy: LocationAccuracy.medium,
+      distanceFilter: 75,
+    );
+
+    _userLocationSub = Geolocator.getPositionStream(
+      locationSettings: settings,
+    ).listen(
+      (position) {
+        _syncUserLocationOnce(position: position);
+      },
+      onError: (Object error) {
+        debugPrint('FEED user_locations stream error: $error');
+        _userLocationSub = null;
+      },
+      onDone: () {
+        _userLocationSub = null;
+      },
+    );
+  }
+
+  String _buildUserLocationZone(double lat, double lng) {
+    return '${lat.toStringAsFixed(2)},${lng.toStringAsFixed(2)}';
+  }
+
+  bool _shouldSkipUserLocationWrite({
+    required double lat,
+    required double lng,
+  }) {
+    final lastAt = _lastUserLocationSyncAt;
+    final lastLat = _lastUserLocationLat;
+    final lastLng = _lastUserLocationLng;
+    if (lastAt == null || lastLat == null || lastLng == null) return false;
+
+    final seconds = DateTime.now().difference(lastAt).inSeconds;
+    final meters = Geolocator.distanceBetween(lastLat, lastLng, lat, lng);
+    return seconds < 30 && meters < 50;
+  }
+
+  Future<void> _syncUserLocationOnce({
+    bool forceCurrent = false,
+    Position? position,
+  }) async {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid == null || uid.isEmpty) return;
+    if (_userLocationSyncInFlight) return;
+
+    try {
+      _userLocationSyncInFlight = true;
+
+      Position? pos = position;
+      if (pos == null) {
+        final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+        if (!serviceEnabled) return;
+
+        var permission = await Geolocator.checkPermission();
+        if (permission == LocationPermission.denied) {
+          permission = await Geolocator.requestPermission();
+        }
+        if (permission == LocationPermission.denied ||
+            permission == LocationPermission.deniedForever) {
+          return;
+        }
+
+        if (!forceCurrent) {
+          pos = await Geolocator.getLastKnownPosition();
+        }
+        pos ??= await Geolocator.getCurrentPosition(
+          desiredAccuracy: LocationAccuracy.medium,
+        );
+      }
+
+      if (_shouldSkipUserLocationWrite(
+        lat: pos.latitude,
+        lng: pos.longitude,
+      )) {
+        return;
+      }
+
+      final payload = <String, dynamic>{
+        'user_id': uid,
+        'latitude': pos.latitude,
+        'longitude': pos.longitude,
+        'zone': _buildUserLocationZone(pos.latitude, pos.longitude),
+        'updated_at': DateTime.now().toIso8601String(),
+      };
+
+      await supabase.from('user_locations').upsert(
+            payload,
+            onConflict: 'user_id',
+          );
+
+      _lastUserLocationSyncAt = DateTime.now();
+      _lastUserLocationLat = pos.latitude;
+      _lastUserLocationLng = pos.longitude;
+      debugPrint(
+          'FEED user_locations upsert user=$uid lat=${pos.latitude} lng=${pos.longitude}');
+    } catch (e) {
+      debugPrint('FEED user_locations sync error user=$uid error=$e');
+    } finally {
+      _userLocationSyncInFlight = false;
+    }
+  }
+
+  Future<String?> _resolveViewerDbUserId() async {
+    final firebaseUid = FirebaseAuth.instance.currentUser?.uid;
+    if (firebaseUid == null || firebaseUid.isEmpty) {
+      _viewerDbUserId = null;
+      _viewerDbUserIdForFirebaseUid = null;
+      _viewerDbUserIdFuture = null;
+      return null;
+    }
+
+    if (_viewerDbUserId != null && _viewerDbUserIdForFirebaseUid == firebaseUid) {
+      return _viewerDbUserId;
+    }
+
+    final inFlight = _viewerDbUserIdFuture;
+    if (inFlight != null) {
+      return inFlight;
+    }
+
+    _viewerDbUserIdFuture = () async {
+      try {
+        final row = await supabase
+            .from('users')
+            .select('id')
+            .eq('firebase_uid', firebaseUid)
+            .maybeSingle();
+
+        final dbId = row?['id']?.toString();
+        if (dbId == null || dbId.isEmpty) {
+          debugPrint('FEED viewerDbId missing for firebase_uid=$firebaseUid');
+          return null;
+        }
+
+        _viewerDbUserId = dbId;
+        _viewerDbUserIdForFirebaseUid = firebaseUid;
+        return dbId;
+      } catch (e) {
+        debugPrint(
+            'FEED viewerDbId resolve error firebase_uid=$firebaseUid error=$e');
+        return null;
+      } finally {
+        _viewerDbUserIdFuture = null;
+      }
+    }();
+
+    return _viewerDbUserIdFuture;
+  }
+
+  void _markFeedInactive() {
+    _lastFeedInactiveAt = DateTime.now();
+  }
+
+  void _maybeRefreshAfterInactivity({bool forceIfEmpty = false}) {
+    final now = DateTime.now();
+    final shouldRefresh = forceIfEmpty && posts.isEmpty
+        ? true
+        : (_lastFeedInactiveAt != null &&
+            now.difference(_lastFeedInactiveAt!) >= _inactiveRefreshThreshold);
+    if (!shouldRefresh) return;
+    _resetFeedStateForReload();
+    _loadMorePosts();
+  }
+
+  void _resetFeedStateForReload() {
+    _cancelViewTimer();
+    _didInitialFeedLoad = false;
+    currentIndex = 0;
+    _loadedFeedPostIds.clear();
+    _impressionMarkedPostIds.clear();
+    _viewRegisteredPosts.clear();
+    _viewInFlightPosts.clear();
+    _feedController.reset();
+
+    for (final c in videoControllers.values) {
+      try {
+        c.pause();
+        c.dispose();
+      } catch (_) {}
+    }
+    videoControllers.clear();
+    _videoInitEpoch.clear();
+    _videoInitInFlight.clear();
+    _videoInitFailed.clear();
+    _videoRetryAfter.clear();
+    _loggedPosts.clear();
+    posts.clear();
+    likedLocal.clear();
+    localLikes.clear();
+    hasMore = true;
+    isLoading = false;
+
+    if (_pageController.hasClients) {
+      try {
+        _pageController.jumpToPage(0);
+      } catch (_) {}
+    }
+    if (mounted) {
+      setState(() {});
     }
   }
 
   Future<void> _loadMorePosts() async {
     if (isLoading || !hasMore) return;
 
+    final firebaseUid = FirebaseAuth.instance.currentUser?.uid;
+    if (firebaseUid == null || firebaseUid.isEmpty) {
+      debugPrint('FEED load skipped: viewerId null');
+      return;
+    }
+    _resolveViewerDbUserId();
+
     if (!mounted) return;
     setState(() => isLoading = true);
 
-    final from = posts.length;
-    final to = from + limit - 1;
-
-    List<dynamic> res = [];
-
     try {
-      res = await supabase
+      final rankedItems = posts.isEmpty
+          ? await _feedController.fetchFirstPage(
+              viewerId: firebaseUid, pageSize: limit)
+          : await _feedController.fetchNextPage(pageSize: limit);
+      hasMore = _feedController.state.hasMore;
+
+      if (rankedItems.isEmpty) {
+        if (!_feedController.state.hasMore) {
+          hasMore = false;
+        }
+        return;
+      }
+
+      final rankedPostIds = rankedItems.map((e) => e.postId).toList();
+      final rows = await supabase
           .from('posts')
           .select(
               'id, seller_id, media_url, thumbnail_url, thumbnail_path, video_variants, is_video, timestamp')
-          .order('timestamp', ascending: false)
-          .range(from, to);
+          .inFilter('id', rankedPostIds);
 
       if (!mounted) return;
 
-      if (res.isEmpty) {
-        hasMore = false;
-      } else {
-        final loadedIds = <String>[];
-        for (var r in res) {
-          r['id'] = r['id']?.toString();
-          final id = r['id']?.toString();
-          if (id == null || id.isEmpty) continue;
+      final byId = <String, Map<String, dynamic>>{};
+      for (final raw in rows) {
+        final row = Map<String, dynamic>.from(raw);
+        final id = row['id']?.toString();
+        if (id == null || id.isEmpty) continue;
+        row['id'] = id;
+        byId[id] = row;
+      }
 
-          // Phase 1: minimal payload for instant media rendering.
-          final post = <String, dynamic>{
-            'id': id,
-            'seller_id': r['seller_id'],
-            'media_url': r['media_url'],
-            'thumbnail_url': r['thumbnail_url'],
-            'thumbnail_path': r['thumbnail_path'],
-            'video_variants': r['video_variants'],
-            'is_video': r['is_video'],
-            'timestamp': r['timestamp'],
-            // Phase 2 fields start with lightweight defaults.
-            'seller_name': 'Utilisateur',
-            'avatar_url': null,
-            'description': '',
-            'comments_count': 0,
-            'likes': 0,
-          };
+      final loadedIds = <String>[];
+      final appendedRows = <Map<String, dynamic>>[];
+      for (final ranked in rankedItems) {
+        final r = byId[ranked.postId];
+        if (r == null) continue;
+        if (!_loadedFeedPostIds.add(ranked.postId)) continue;
 
-          posts.add(post);
-          localLikes[id] = 0;
-          loadedIds.add(id);
+        final post = <String, dynamic>{
+          'id': ranked.postId,
+          'seller_id': r['seller_id'],
+          'media_url': r['media_url'],
+          'thumbnail_url': r['thumbnail_url'],
+          'thumbnail_path': r['thumbnail_path'],
+          'video_variants': r['video_variants'],
+          'is_video': r['is_video'],
+          'timestamp': r['timestamp'],
+          'normalized_score': ranked.normalizedScore,
+          'random_score': ranked.randomScore,
+          'popularity_score': ranked.popularityScore,
+          'seller_name': 'Utilisateur',
+          'avatar_url': null,
+          'description': '',
+          'comments_count': 0,
+          'likes': 0,
+        };
 
-          if (!_loggedPosts.contains(id)) {
-            _loggedPosts.add(id);
-            debugPrint(
-                "FEED render post=$id is_video=${post['is_video']} media_url=${post['media_url']} thumb=${post['thumbnail_url'] ?? post['thumbnail_path']} variants=${post['video_variants'] != null}");
-          }
-        }
+        posts.add(post);
+        appendedRows.add(r);
+        localLikes[ranked.postId] = localLikes[ranked.postId] ?? 0;
+        loadedIds.add(ranked.postId);
 
-        // Phase 2: hydrate non-video metadata asynchronously.
-        _hydratePostMeta(loadedIds);
-
-        if (from == 0 && posts.isNotEmpty) {
-          _maybeInitAroundIndex(currentIndex);
-          _playCurrentIfNeeded();
+        if (!_loggedPosts.contains(ranked.postId)) {
+          _loggedPosts.add(ranked.postId);
+          debugPrint(
+              "FEED ranked post=${ranked.postId} score=${ranked.normalizedScore} is_video=${post['is_video']} media_url=${post['media_url']}");
         }
       }
 
-      // ⚠️ precacheImage utilise CONTEXT → mounted obligatoire
-      if (!mounted) return;
+      if (loadedIds.isNotEmpty) {
+        _hydratePostMeta(loadedIds);
+      }
 
-      for (var r in res) {
+      if (!_didInitialFeedLoad && posts.isNotEmpty) {
+        _didInitialFeedLoad = true;
+        currentIndex = 0;
+        _maybeInitAroundIndex(currentIndex);
+        _playCurrentIfNeeded();
+        _markImpressionForCurrentPost();
+      }
+
+      if (!mounted) return;
+      for (final r in appendedRows) {
         final rawMediaUrl = r['media_url']?.toString() ?? '';
         final isVideo = r['is_video'] == true;
-
         if (!isVideo && rawMediaUrl.isNotEmpty) {
           final mediaUrl = resolveMediaUrl(rawMediaUrl);
-          precacheImage(
-            CachedNetworkImageProvider(mediaUrl),
-            context,
-          );
+          precacheImage(CachedNetworkImageProvider(mediaUrl), context);
         }
       }
     } catch (e, st) {
-      debugPrint("Erreur load posts : $e\n$st");
+      debugPrint("Erreur load personalized posts : $e\n$st");
     } finally {
       if (mounted) {
         setState(() => isLoading = false);
       }
     }
 
-    // Keep likes loading non-blocking so video init remains priority.
     if (!mounted) return;
     _loadLikesForPosts();
   }
@@ -191,7 +579,7 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
     try {
       final rows = await supabase
           .from('posts')
-          .select('id, seller_name, avatar_url, description, comments_count')
+          .select('id, seller_name, avatar_url, description')
           .inFilter('id', ids);
       if (!mounted) return;
       final byId = <String, Map<String, dynamic>>{};
@@ -210,9 +598,9 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
           p['seller_name'] = m['seller_name'] ?? p['seller_name'];
           p['avatar_url'] = m['avatar_url'];
           p['description'] = m['description'] ?? p['description'];
-          p['comments_count'] = m['comments_count'] ?? p['comments_count'];
         }
       });
+      unawaited(_loadCommentCountsForPosts(onlyPostIds: ids));
     } catch (e) {
       debugPrint('Erreur hydrate post meta: $e');
     }
@@ -290,6 +678,12 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
       setState(() {});
     } catch (e) {
       debugPrint("Erreur init video ($postId): $e");
+      CrashlyticsLogger.log('video:init_error post=$postId');
+      unawaited(CrashlyticsLogger.recordNonFatal(
+        e,
+        StackTrace.current,
+        reason: 'feed_video_initialize',
+      ));
       _videoInitFailed.add(postId);
       _videoRetryAfter[postId] = DateTime.now().add(const Duration(seconds: 8));
       videoControllers.remove(postId);
@@ -434,12 +828,43 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
     });
   }
 
-  void openPublicProfile(String sellerId) {
-    Navigator.pushNamed(
+  void _markImpressionForCurrentPost() {
+    if (currentIndex < 0 || currentIndex >= posts.length) return;
+    final postId = posts[currentIndex]['id']?.toString();
+    if (postId == null || postId.isEmpty) return;
+    _markFeedImpression(postId);
+  }
+
+  Future<void> _markFeedImpression(String postId) async {
+    final viewerDbId = await _resolveViewerDbUserId();
+    if (viewerDbId == null || viewerDbId.isEmpty) return;
+    if (_impressionMarkedPostIds.contains(postId)) return;
+    _impressionMarkedPostIds.add(postId);
+    try {
+      await supabase.from('feed_impressions').upsert(
+        {
+          'user_id': viewerDbId,
+          'post_id': postId,
+          'seen_at': DateTime.now().toIso8601String(),
+        },
+        onConflict: 'user_id,post_id',
+        ignoreDuplicates: true,
+      );
+    } catch (e) {
+      debugPrint(
+          'FEED impression error post=$postId user=$viewerDbId error=$e');
+      _impressionMarkedPostIds.remove(postId);
+    }
+  }
+
+  Future<void> openPublicProfile(String sellerId) async {
+    _markFeedInactive();
+    await Navigator.pushNamed(
       context,
       '/publicProfile',
       arguments: sellerId,
     );
+    _maybeRefreshAfterInactivity();
   }
 
   void _playCurrentIfNeeded() {
@@ -469,6 +894,7 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
     currentIndex = index;
     _maybeInitAroundIndex(index);
     _playCurrentIfNeeded();
+    _markImpressionForCurrentPost();
 
     if (index >= posts.length - 3) {
       _loadMorePosts();
@@ -851,6 +1277,10 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
   }
 
   void _openComments(String postId) {
-    openComments(context, postId);
+    _markFeedInactive();
+    openComments(context, postId).whenComplete(() {
+      _maybeRefreshAfterInactivity();
+      unawaited(_loadCommentCountsForPosts(onlyPostIds: [postId]));
+    });
   }
 }
