@@ -1,6 +1,4 @@
 import 'dart:io';
-import 'package:connectivity_plus/connectivity_plus.dart';
-import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:video_player/video_player.dart';
 import 'storage_url.dart';
 import '../services/crashlytics_logger.dart';
@@ -40,27 +38,8 @@ Future<String> resolveBestVideoUrl({
       return resolveMediaUrl(mediaPath);
     }
 
-    final connectivity = await Connectivity().checkConnectivity();
-    List<String> preference;
-    switch (connectivity) {
-      case ConnectivityResult.wifi:
-      case ConnectivityResult.ethernet:
-      case ConnectivityResult.vpn:
-        preference = const ['1080', '720', '360'];
-        break;
-      case ConnectivityResult.mobile:
-        preference = const ['360', '720', '1080'];
-        break;
-      case ConnectivityResult.bluetooth:
-      case ConnectivityResult.other:
-        preference = const ['720', '360', '1080'];
-        break;
-      case ConnectivityResult.none:
-        CrashlyticsLogger.log('video_resolver:offline_fallback path=$mediaPath');
-        return resolveMediaUrl(mediaPath);
-    }
-
-    final chosen = _pickVariantPath(variants, preference);
+    // Cost policy: always serve 720p when available.
+    final chosen = _pickVariantPath(variants, const ['720', '360', '1080']);
     final resolved = resolveMediaUrl(chosen ?? mediaPath);
     CrashlyticsLogger.log(
         'video_resolver:resolved path=$mediaPath chosen=${chosen ?? mediaPath}');

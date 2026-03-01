@@ -211,9 +211,7 @@ class DraftPublishService {
         final baseDir = lastSlash == -1 ? mediaPath : mediaPath.substring(0, lastSlash);
         final variantsDir = '$baseDir/variants';
         videoVariants = {
-          '360': '$variantsDir/360p.mp4',
           '720': '$variantsDir/720p.mp4',
-          '1080': '$variantsDir/1080p.mp4',
         };
       }
 

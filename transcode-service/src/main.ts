@@ -181,6 +181,7 @@ function buildStorageCandidates(bucket: string, sourceName: string) {
 }
 
 function shouldIgnore(name: string) {
+  if (name.startsWith("messages/") || name.startsWith("posts/messages/")) return true;
   if (name.includes("/variants/")) return true;
   return /\.(jpg|jpeg|png|webp)$/i.test(name);
 }
@@ -190,14 +191,10 @@ function isLikelyVideo(name: string, contentType?: string) {
   return /\.(mp4|mov|mkv|webm)$/i.test(name);
 }
 
-function buildVariantPaths(objectName: string) {
+function build720VariantPath(objectName: string) {
   const dir = path.posix.dirname(objectName);
   const variantsDir = `${dir}/variants`;
-  return {
-    "360": `${variantsDir}/360p.mp4`,
-    "720": `${variantsDir}/720p.mp4`,
-    "1080": `${variantsDir}/1080p.mp4`,
-  };
+  return `${variantsDir}/720p.mp4`;
 }
 
 async function createSignedUrl(bucket: string, objectName: string) {
@@ -266,6 +263,14 @@ async function uploadObject(
   return data;
 }
 
+async function deleteObject(
+  bucket: string,
+  objectName: string,
+) {
+  const { error } = await supabase.storage.from(bucket).remove([objectName]);
+  if (error) throw error;
+}
+
 async function readFileBuffer(filePath: string) {
   const fs = await import("node:fs/promises");
   return fs.readFile(filePath);
@@ -274,12 +279,19 @@ async function readFileBuffer(filePath: string) {
 async function updatePostVariants(
   sourceName: string,
   objectName: string,
-  variants: Record<string, string>,
+  variant720Path: string,
 ) {
+  const variants = { "720": variant720Path };
   const { error } = await supabase
     .from("posts")
-    .update({ video_variants: variants })
-    .or(`media_path.eq.${sourceName},media_path.eq.${objectName}`);
+    .update({
+      media_path: variant720Path,
+      media_url: variant720Path,
+      video_variants: variants,
+    })
+    .or(
+      `media_path.eq.${sourceName},media_path.eq.${objectName},media_url.eq.${sourceName},media_url.eq.${objectName}`,
+    );
   if (error) throw error;
 }
 
@@ -342,34 +354,42 @@ async function runTranscode(
   const buf = Buffer.from(await res.arrayBuffer());
   await writeFile(inputPath, buf);
 
-  const variants = buildVariantPaths(objectName);
-
   logStep(ctx, "transcode_start");
-  for (const [key, targetPath] of Object.entries(variants)) {
-    const height = Number(key);
-    const outPath = path.join(workDir, `${key}.mp4`);
-    log("FFMPEG", key, "START");
-    await spawnFfmpeg([
-      "-i", inputPath,
-      "-vf", `scale='if(gt(ih,${height}),-2,iw)':'if(gt(ih,${height}),${height},ih)'`,
-      "-c:v", "libx264",
-      "-profile:v", "main",
-      "-preset", "veryfast",
-      "-crf", "23",
-      "-c:a", "aac",
-      "-b:a", "128k",
-      "-movflags", "+faststart",
-      outPath,
-    ]);
-    log("UPLOAD TARGET", targetPath);
-    logStep(ctx, "upload_start", { targetPath });
-    const data = await uploadObject(bucket, targetPath, outPath);
-    log("UPLOAD OK", data);
-  }
+  const targetPath = build720VariantPath(objectName);
+  const outPath = path.join(workDir, "720.mp4");
+  const height = 720;
+  log("FFMPEG", "720", "START");
+  await spawnFfmpeg([
+    "-i", inputPath,
+    "-vf", `scale='if(gt(ih,${height}),-2,iw)':'if(gt(ih,${height}),${height},ih)'`,
+    "-c:v", "libx264",
+    "-profile:v", "main",
+    "-preset", "veryfast",
+    "-crf", "23",
+    "-c:a", "aac",
+    "-b:a", "128k",
+    "-movflags", "+faststart",
+    outPath,
+  ]);
+  log("UPLOAD TARGET", targetPath);
+  logStep(ctx, "upload_start", { targetPath });
+  const data = await uploadObject(bucket, targetPath, outPath);
+  log("UPLOAD OK", data);
 
   logStep(ctx, "upload_ok");
-  await updatePostVariants(sourceName, objectName, variants);
+  await updatePostVariants(sourceName, objectName, targetPath);
   logStep(ctx, "db_update_ok");
+  if (objectName !== targetPath) {
+    try {
+      await deleteObject(bucket, objectName);
+      logStep(ctx, "source_delete_ok", { objectName });
+    } catch (e: any) {
+      logStep(ctx, "source_delete_failed", {
+        objectName,
+        error: e?.message || String(e),
+      });
+    }
+  }
 
   rmSync(workDir, { recursive: true, force: true });
   return objectName;
