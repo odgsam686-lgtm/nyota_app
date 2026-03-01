@@ -21,6 +21,93 @@ class DraftPublishResult {
 
 /// Publishes a local draft to Supabase (no UI, no Hive).
 class DraftPublishService {
+  static const Map<String, List<String>> _categoryKeywords = {
+    'telephone': [
+      'phone',
+      'iphone',
+      'samsung',
+      'xiaomi',
+      'tecno',
+      'itel',
+      'huawei',
+      'android',
+      'chargeur',
+      'cable',
+      'coque',
+    ],
+    'vetements': [
+      'shirt',
+      'pants',
+      'jean',
+      'dress',
+      'shoe',
+      'bag',
+      'tshirt',
+      'jacket',
+      'chemise',
+      'pantalon',
+      'robe',
+      'chaussure',
+      'sandale',
+      'basket',
+    ],
+    'cosmetique': [
+      'parfum',
+      'creme',
+      'lotion',
+      'huile',
+      'maquillage',
+      'beaute',
+      'savon',
+    ],
+    'electromenager': [
+      'tv',
+      'laptop',
+      'speaker',
+      'pc',
+      'ordinateur',
+      'mixeur',
+      'ventilateur',
+      'frigo',
+      'refrigerateur',
+      'cuiseur',
+      'fer',
+    ],
+    'alimentation': [
+      'food',
+      'rice',
+      'oil',
+      'milk',
+      'jus',
+      'boisson',
+      'riz',
+      'huile',
+      'lait',
+      'sucre',
+      'farine',
+    ],
+    'accessoires': [
+      'watch',
+      'bracelet',
+      'earbuds',
+      'airpods',
+      'montre',
+      'lunette',
+      'bijou',
+    ],
+  };
+
+  static String _detectCategory(String description) {
+    final text = description.toLowerCase().trim();
+    if (text.isEmpty) return 'divers';
+    for (final entry in _categoryKeywords.entries) {
+      if (entry.value.any((kw) => text.contains(kw))) {
+        return entry.key;
+      }
+    }
+    return 'divers';
+  }
+
   static Future<void> _copyUserLocationToPostLocation({
     required SupabaseClient supabase,
     required String firebaseUid,
@@ -138,6 +225,7 @@ class DraftPublishService {
         'media_type': draft.isVideo ? 'video' : 'image',
         'is_video': draft.isVideo,
         'description': draft.description,
+        'category': _detectCategory(draft.description),
         'likes': 0,
       };
       if (thumbnailPath != null && thumbnailPath.isNotEmpty) {

@@ -71,52 +71,56 @@ class NotificationService {
   }
 
   Future<void> _registerDevice({String? tokenOverride}) async {
-    final uid = _userId ?? FirebaseAuth.instance.currentUser?.uid;
-    if (uid == null) return;
-    final token = tokenOverride ?? await _messaging.getToken();
-    if (token == null || token.isEmpty) return;
-    final idToken = await FirebaseAuth.instance.currentUser?.getIdToken();
-    if (idToken == null) return;
-    final platform = Platform.isIOS
-        ? 'ios'
-        : Platform.isAndroid
-            ? 'android'
-            : 'web';
-    http.Response? lastResponse;
-    Object? lastError;
-    for (final base in _functionsBases) {
-      try {
-        final res = await http.post(
-          Uri.parse('$base/register-device'),
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': 'Bearer $idToken',
-          },
-          body: jsonEncode({
-            'user_id': uid,
-            'fcm_token': token,
-            'platform': platform,
-          }),
-        );
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          debugPrint(
-            'register-device success user=$uid platform=$platform token=${token.substring(0, token.length > 12 ? 12 : token.length)}...',
+    try {
+      final uid = _userId ?? FirebaseAuth.instance.currentUser?.uid;
+      if (uid == null) return;
+      final token = tokenOverride ?? await _messaging.getToken();
+      if (token == null || token.isEmpty) return;
+      final idToken = await FirebaseAuth.instance.currentUser?.getIdToken();
+      if (idToken == null) return;
+      final platform = Platform.isIOS
+          ? 'ios'
+          : Platform.isAndroid
+              ? 'android'
+              : 'web';
+      http.Response? lastResponse;
+      Object? lastError;
+      for (final base in _functionsBases) {
+        try {
+          final res = await http.post(
+            Uri.parse('$base/register-device'),
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer $idToken',
+            },
+            body: jsonEncode({
+              'user_id': uid,
+              'fcm_token': token,
+              'platform': platform,
+            }),
           );
-          return;
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            debugPrint(
+              'register-device success user=$uid platform=$platform token=${token.substring(0, token.length > 12 ? 12 : token.length)}...',
+            );
+            return;
+          }
+          lastResponse = res;
+        } catch (e) {
+          lastError = e;
         }
-        lastResponse = res;
-      } catch (e) {
-        lastError = e;
       }
-    }
-    if (lastResponse != null) {
-      final body = lastResponse.body;
-      final preview = body.length > 300 ? '${body.substring(0, 300)}...' : body;
-      debugPrint(
-        'register-device failed: ${lastResponse.statusCode} $preview',
-      );
-    } else if (lastError != null) {
-      debugPrint('register-device failed: $lastError');
+      if (lastResponse != null) {
+        final body = lastResponse.body;
+        final preview = body.length > 300 ? '${body.substring(0, 300)}...' : body;
+        debugPrint(
+          'register-device failed: ${lastResponse.statusCode} $preview',
+        );
+      } else if (lastError != null) {
+        debugPrint('register-device failed: $lastError');
+      }
+    } catch (e) {
+      debugPrint('register-device skipped (network/token): $e');
     }
   }
 
@@ -168,6 +172,8 @@ class NotificationService {
 
       // garde le compteur total à jour
       UnreadCounterService.instance.start(uid);
+    }, onError: (e) {
+      debugPrint('messages stream error: $e');
     });
   }
 

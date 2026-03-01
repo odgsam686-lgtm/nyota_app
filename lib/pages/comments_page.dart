@@ -123,22 +123,28 @@ class _CommentBottomSheetState extends State<CommentBottomSheet> {
   }
 
   Future<void> loadComments() async {
+    if (!mounted) return;
     setState(() => loading = true);
+    try {
+      final data = await supabase
+          .from('comments')
+          .select()
+          .eq('post_id', widget.postId)
+          .order('root_id')
+          .order('created_at');
 
-    final data = await supabase
-        .from('comments')
-        .select()
-        .eq('post_id', widget.postId)
-        .order('root_id')
-        .order('created_at');
-
-    _allComments = List<Map<String, dynamic>>.from(data);
-    await _syncCommentsCount();
-    resetExpandState();
-    _roots = buildCommentTree(_allComments);
-    await _loadMyLikes();
-
-    setState(() => loading = false);
+      _allComments = List<Map<String, dynamic>>.from(data);
+      await _syncCommentsCount();
+      resetExpandState();
+      _roots = buildCommentTree(_allComments);
+      await _loadMyLikes();
+    } catch (e) {
+      debugPrint('load comments error: $e');
+    } finally {
+      if (mounted) {
+        setState(() => loading = false);
+      }
+    }
   }
 
   void _listenCommentsRealtime() {
@@ -276,6 +282,7 @@ class _CommentBottomSheetState extends State<CommentBottomSheet> {
         maxWidth: 1280,
       );
       if (picked == null) return;
+      if (!mounted) return;
       setState(() {
         _pendingImageFile = File(picked.path);
       });
@@ -289,6 +296,10 @@ class _CommentBottomSheetState extends State<CommentBottomSheet> {
 
   void _clearPendingImage() {
     if (_pendingImageFile == null) return;
+    if (!mounted) {
+      _pendingImageFile = null;
+      return;
+    }
     setState(() {
       _pendingImageFile = null;
     });
@@ -1031,7 +1042,7 @@ Widget _buildCommentContent(String content) {
           child: ClipRRect(
             borderRadius: BorderRadius.circular(10),
             child: Image.network(
-              url!,
+              url,
               height: 140,
               width: 180,
               fit: BoxFit.cover,

@@ -89,6 +89,7 @@ class _PublicProfilePageState extends State<PublicProfilePage> {
       isSeller = sellerData!['is_seller'] == true;
 
       /// 👉 ON AFFICHE LE PROFIL TOUT DE SUITE
+      if (!mounted) return;
       setState(() {
         loading = false;
       });
@@ -126,6 +127,7 @@ class _PublicProfilePageState extends State<PublicProfilePage> {
         return row;
       }).toList();
 
+      if (!mounted) return;
       setState(() {
         posts = postsWithViews;
       });
@@ -142,6 +144,7 @@ class _PublicProfilePageState extends State<PublicProfilePage> {
             .eq('follower_id', current.uid)
             .limit(1);
 
+        if (!mounted) return;
         setState(() {
           isFollowing = followCheck.isNotEmpty;
         });
@@ -152,6 +155,7 @@ class _PublicProfilePageState extends State<PublicProfilePage> {
       /// =========================
       final stats = await ProfileStatsService.loadStats(widget.sellerId);
 
+      if (!mounted) return;
       setState(() {
         followersCount = stats.followers;
         followingCount = stats.following;
@@ -160,6 +164,7 @@ class _PublicProfilePageState extends State<PublicProfilePage> {
       });
     } catch (e) {
       debugPrint("PROFILE LOAD ERROR: $e");
+      if (!mounted) return;
       setState(() {
         loading = false;
       });
@@ -181,6 +186,7 @@ class _PublicProfilePageState extends State<PublicProfilePage> {
             .eq('seller_id', widget.sellerId)
             .eq('follower_id', current.uid);
 
+        if (!mounted) return;
         setState(() {
           isFollowing = false;
           followersCount--;
@@ -191,6 +197,7 @@ class _PublicProfilePageState extends State<PublicProfilePage> {
           'follower_id': current.uid,
         });
 
+        if (!mounted) return;
         setState(() {
           isFollowing = true;
           followersCount++;
@@ -506,7 +513,7 @@ class _PublicProfilePageState extends State<PublicProfilePage> {
                         onPressed: () async {
                           final convoId =
                               await getOrCreateConversation(widget.sellerId);
-                          if (!mounted) return;
+                          if (!context.mounted) return;
                           Navigator.push(
                             context,
                             MaterialPageRoute(

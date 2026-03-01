@@ -498,9 +498,13 @@ Future<void> _saveDraft() async {
     final supabase = Supabase.instance.client;
 
     // 1️⃣ Créer le post D'ABORD (pour obtenir postId)
+    final description = _descriptionCtrl.text.trim();
+    final category = autoDetectCategory(description);
+
     final postInsert = await supabase.from('posts').insert({
       "seller_id": user.uid,
-      "description": _descriptionCtrl.text.trim(),
+      "description": description,
+      "category": category,
       "is_video": _isVideo,
       "created_at": DateTime.now().toIso8601String(),
       "likes": 0,

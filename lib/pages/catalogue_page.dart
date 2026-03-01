@@ -27,6 +27,7 @@ class _CatalogPageState extends State<CatalogPage> {
   String selectedCategory = 'all';
   List<Map<String, dynamic>> subcategories = [];
   String selectedSubcategory = 'all';
+  Map<String, List<Map<String, dynamic>>> _categoryPreviewPosts = {};
   List<Map<String, dynamic>> products = [];
   bool loading = true;
   bool _loadingMore = false;
@@ -59,12 +60,10 @@ class _CatalogPageState extends State<CatalogPage> {
     final normalized = fetched.map((c) {
       final id = (c['id'] ?? c['slug'] ?? 'all').toString();
       final label = (c['label'] ?? id).toString();
-      return <String, dynamic>{'id': id, 'label': label};
+      final count = int.tryParse((c['count'] ?? c['rows_count'] ?? '0').toString()) ?? 0;
+      return <String, dynamic>{'id': id, 'label': label, 'count': count};
     }).toList();
-
-    if (!normalized.any((c) => c['id'] == 'all')) {
-      normalized.insert(0, {'id': 'all', 'label': 'Tous'});
-    }
+    normalized.removeWhere((c) => c['id'] == 'all');
 
     if (!mounted) return;
     setState(() {
@@ -72,17 +71,83 @@ class _CatalogPageState extends State<CatalogPage> {
       selectedCategory = 'all';
       subcategories = [];
       selectedSubcategory = 'all';
+      products = [];
     });
-    await _loadProductsFor('all');
+    await _loadCategoryCards();
   }
 
   void _onGridScroll() {
     if (!_gridScrollController.hasClients) return;
+    if (selectedCategory == 'all') return;
     if (loading || _loadingMore || !_hasMore) return;
     final pos = _gridScrollController.position;
     if (pos.extentAfter <= _loadMoreThresholdPx) {
       unawaited(_loadMoreProducts());
     }
+  }
+
+  Future<void> _loadCategoryCards() async {
+    final requestEpoch = ++_productsRequestEpoch;
+    if (mounted) {
+      setState(() {
+        loading = true;
+        selectedCategory = 'all';
+        selectedSubcategory = 'all';
+        subcategories = [];
+      });
+    }
+
+    final futures = categories.map((c) async {
+      final cid = (c['id'] ?? c['slug'] ?? '').toString();
+      if (cid.isEmpty) return MapEntry<String, List<Map<String, dynamic>>>(cid, []);
+      try {
+        final rows = await svc.fetchProductsByCategoryLite(
+          category: cid,
+          limit: 3,
+          offset: 0,
+        );
+        return MapEntry<String, List<Map<String, dynamic>>>(
+          cid,
+          List<Map<String, dynamic>>.from(rows),
+        );
+      } catch (_) {
+        return MapEntry<String, List<Map<String, dynamic>>>(cid, []);
+      }
+    }).toList();
+
+    final results = await Future.wait(futures);
+    if (!mounted || requestEpoch != _productsRequestEpoch) return;
+
+    final previewMap = <String, List<Map<String, dynamic>>>{};
+    final visibleCategories = <Map<String, dynamic>>[];
+    for (final entry in results) {
+      if (entry.key.isEmpty || entry.value.isEmpty) continue;
+      previewMap[entry.key] = entry.value;
+      final cat = categories.firstWhere(
+        (c) => (c['id'] ?? '').toString() == entry.key,
+        orElse: () => {'id': entry.key, 'label': entry.key, 'count': entry.value.length},
+      );
+      visibleCategories.add(cat);
+    }
+
+    visibleCategories.sort((a, b) {
+      final aId = (a['id'] ?? '').toString().toLowerCase();
+      final bId = (b['id'] ?? '').toString().toLowerCase();
+      if (aId == 'divers' && bId != 'divers') return -1;
+      if (bId == 'divers' && aId != 'divers') return 1;
+      final aCount = int.tryParse((a['count'] ?? '0').toString()) ?? 0;
+      final bCount = int.tryParse((b['count'] ?? '0').toString()) ?? 0;
+      return bCount.compareTo(aCount);
+    });
+
+    setState(() {
+      categories = visibleCategories;
+      _categoryPreviewPosts = previewMap;
+      loading = false;
+      products = [];
+      _hasMore = false;
+      _loadingMore = false;
+    });
   }
 
   Future<void> _loadSubcategoriesFor(String category, int requestEpoch) async {
@@ -124,6 +189,11 @@ class _CatalogPageState extends State<CatalogPage> {
         selectedCategory = category;
         selectedSubcategory = subcategory;
       });
+    }
+
+    if (category == 'all') {
+      await _loadCategoryCards();
+      return;
     }
 
     unawaited(_loadSubcategoriesFor(category, requestEpoch));
@@ -202,6 +272,13 @@ class _CatalogPageState extends State<CatalogPage> {
       if (!mounted || requestEpoch != _productsRequestEpoch) return;
       setState(() => loading = false);
     }
+  }
+
+  Future<void> _refreshCurrentView() async {
+    await _loadProductsFor(
+      selectedCategory,
+      subcategory: selectedSubcategory,
+    );
   }
 
   Future<void> _loadMoreProducts() async {
@@ -374,204 +451,477 @@ class _CatalogPageState extends State<CatalogPage> {
     }
   }
 
+  String _activeFilterLabel() {
+    final categoryLabel = categories
+            .firstWhere(
+              (c) => (c['id'] ?? c['slug'] ?? '').toString() == selectedCategory,
+              orElse: () => {'label': selectedCategory},
+            )['label']
+            ?.toString() ??
+        selectedCategory;
+
+    if (selectedSubcategory == 'all') return categoryLabel;
+    final subLabel = subcategories
+            .firstWhere(
+              (s) => (s['slug'] ?? '').toString() == selectedSubcategory,
+              orElse: () => {'label': selectedSubcategory},
+            )['label']
+            ?.toString() ??
+        selectedSubcategory;
+    return '$categoryLabel • $subLabel';
+  }
+
+  Widget _buildLoadingGrid() {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final crossAxisCount = constraints.maxWidth < 430 ? 3 : 4;
+        return GridView.builder(
+          padding: const EdgeInsets.all(8),
+          itemCount: 12,
+          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: crossAxisCount,
+            crossAxisSpacing: 8,
+            mainAxisSpacing: 8,
+            childAspectRatio: 0.7,
+          ),
+          itemBuilder: (_, __) => ClipRRect(
+            borderRadius: BorderRadius.circular(8),
+            child: Container(
+              color: Colors.grey.shade200,
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildCategoryPreviewMedia(Map<String, dynamic> p, String uniqueKey) {
+    final media = p['media_url']?.toString() ?? '';
+    if (media.isEmpty) {
+      return Container(color: Colors.grey.shade300);
+    }
+    final resolvedMedia = resolveMediaUrl(media);
+    final rawVariants = p['video_variants'];
+    final variants = rawVariants is Map
+        ? Map<String, dynamic>.from(rawVariants)
+        : null;
+    final rawThumb = p['thumbnail_url'] ?? p['thumbnail_path'];
+    final thumbnailUrl = rawThumb != null && rawThumb.toString().isNotEmpty
+        ? resolveMediaUrl(rawThumb.toString())
+        : null;
+    final isVideo = p['media_type'] == 'video' ||
+        p['is_video'] == true ||
+        p['is_video']?.toString() == 'true';
+
+    if (isVideo) {
+      return VideoPreviewTile(
+        key: ValueKey('catalog_cat_video_$uniqueKey'),
+        mediaPath: media,
+        variants: variants,
+        thumbnailUrl: thumbnailUrl,
+      );
+    }
+    return CachedNetworkImage(
+      imageUrl: resolvedMedia,
+      fit: BoxFit.cover,
+      placeholder: (_, __) => Container(color: Colors.grey.shade300),
+      errorWidget: (_, __, ___) => Container(
+        color: Colors.grey.shade300,
+        child: const Icon(Icons.broken_image),
+      ),
+    );
+  }
+
+  Widget _buildCategoryCard(Map<String, dynamic> category) {
+    final cid = (category['id'] ?? category['slug'] ?? '').toString();
+    final label = (category['label'] ?? cid).toString();
+    final count = int.tryParse((category['count'] ?? '0').toString()) ?? 0;
+    final previews = _categoryPreviewPosts[cid] ?? const <Map<String, dynamic>>[];
+    if (cid.isEmpty || previews.isEmpty) return const SizedBox.shrink();
+
+    final first = previews[0];
+    final second = previews.length > 1 ? previews[1] : first;
+    final third = previews.length > 2 ? previews[2] : second;
+
+    Widget stackedLayer(
+      Map<String, dynamic> post,
+      String key, {
+      required double top,
+      required double left,
+      required double right,
+      required double bottom,
+      double opacity = 1,
+    }) {
+      return Positioned(
+        top: top,
+        left: left,
+        right: right,
+        bottom: bottom,
+        child: Opacity(
+          opacity: opacity,
+          child: Container(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(
+                color: const Color(0xFFFFFFFF),
+                width: 1.2,
+              ),
+              boxShadow: const [
+                BoxShadow(
+                  color: Color(0x22000000),
+                  blurRadius: 8,
+                  offset: Offset(0, 4),
+                ),
+              ],
+            ),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(14),
+              child: _buildCategoryPreviewMedia(post, key),
+            ),
+          ),
+        ),
+      );
+    }
+
+    return GestureDetector(
+      onTap: () => _loadProductsFor(cid),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Expanded(
+            child: Stack(
+              clipBehavior: Clip.none,
+              children: [
+                stackedLayer(
+                  third,
+                  '${cid}_back2',
+                  top: 14,
+                  left: -12,
+                  right: 12,
+                  bottom: -14,
+                  opacity: 0.36,
+                ),
+                stackedLayer(
+                  second,
+                  '${cid}_back1',
+                  top: 8,
+                  left: -6,
+                  right: 6,
+                  bottom: -8,
+                  opacity: 0.62,
+                ),
+                stackedLayer(
+                  first,
+                  '${cid}_front',
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  bottom: 0,
+                ),
+                const Center(
+                  child: CircleAvatar(
+                    radius: 20,
+                    backgroundColor: Color(0x8AFFFFFF),
+                    child: Icon(
+                      Icons.play_arrow_rounded,
+                      color: Color(0xFF6D7FA6),
+                      size: 26,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 10),
+          Text(
+            label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+              color: Colors.black87,
+              fontWeight: FontWeight.w700,
+              fontSize: 22,
+              height: 1.05,
+            ),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            '$count',
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+              color: Colors.black45,
+              fontWeight: FontWeight.w600,
+              fontSize: 12,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCategoriesLanding() {
+    if (loading) return _buildLoadingGrid();
+    if (categories.isEmpty) {
+      return ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        children: const [
+          SizedBox(height: 120),
+          Center(child: Text('Aucune categorie disponible')),
+        ],
+      );
+    }
+
+    return RefreshIndicator(
+      onRefresh: _loadCategoriesAndProducts,
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final crossAxisCount = constraints.maxWidth < 600 ? 2 : 3;
+          return GridView.builder(
+            physics: const AlwaysScrollableScrollPhysics(),
+            padding: const EdgeInsets.all(10),
+            itemCount: categories.length,
+            gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+              crossAxisCount: crossAxisCount,
+              crossAxisSpacing: 10,
+              mainAxisSpacing: 10,
+              childAspectRatio: 0.72,
+            ),
+            itemBuilder: (_, i) => _buildCategoryCard(categories[i]),
+          );
+        },
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         toolbarHeight: 44,
       ),
-      body: Column(
-        children: [
-          SizedBox(
-            height: 56,
-            child: ListView.separated(
-              scrollDirection: Axis.horizontal,
-              itemCount: categories.length,
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
-              separatorBuilder: (_, __) => const SizedBox(width: 8),
-              itemBuilder: (context, i) {
-                final c = categories[i];
-                final cid = (c['id'] ?? c['slug'] ?? 'all').toString();
-                final label = (c['label'] ?? cid).toString();
-                final isSel = cid == selectedCategory;
-
-                return GestureDetector(
-                  onTap: () => _loadProductsFor(cid),
-                  child: Container(
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-                    decoration: BoxDecoration(
-                      color: isSel ? Colors.deepPurple : Colors.grey.shade200,
-                      borderRadius: BorderRadius.circular(24),
-                    ),
-                    child: Center(
-                      child: Text(
-                        label,
-                        style: TextStyle(
-                          color: isSel ? Colors.white : Colors.black87,
-                        ),
+      body: selectedCategory == 'all'
+          ? _buildCategoriesLanding()
+          : Column(
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(8, 6, 8, 4),
+                  child: Row(
+                    children: [
+                      IconButton(
+                        icon: const Icon(Icons.arrow_back_ios_new, size: 18),
+                        onPressed: () => _loadProductsFor('all'),
                       ),
-                    ),
-                  ),
-                );
-              },
-            ),
-          ),
-          if (selectedCategory != 'all' && subcategories.isNotEmpty)
-            SizedBox(
-              height: 48,
-              child: ListView.separated(
-                scrollDirection: Axis.horizontal,
-                itemCount: subcategories.length + 1,
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-                separatorBuilder: (_, __) => const SizedBox(width: 8),
-                itemBuilder: (context, i) {
-                  final bool isAll = i == 0;
-                  final sid = isAll
-                      ? 'all'
-                      : (subcategories[i - 1]['slug'] ?? '').toString();
-                  final label = isAll
-                      ? 'Tous'
-                      : (subcategories[i - 1]['label'] ??
-                              subcategories[i - 1]['slug'] ??
-                              '')
-                          .toString();
-                  final isSel = sid == selectedSubcategory;
-
-                  return GestureDetector(
-                    onTap: () => _loadProductsFor(
-                      selectedCategory,
-                      subcategory: sid,
-                    ),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 12,
-                        vertical: 7,
-                      ),
-                      decoration: BoxDecoration(
-                        color:
-                            isSel ? Colors.deepPurple.shade400 : Colors.white,
-                        borderRadius: BorderRadius.circular(20),
-                        border: Border.all(
-                          color: isSel
-                              ? Colors.deepPurple.shade400
-                              : Colors.grey.shade300,
-                        ),
-                      ),
-                      child: Center(
+                      Expanded(
                         child: Text(
-                          label,
-                          style: TextStyle(
-                            color: isSel ? Colors.white : Colors.black87,
-                            fontSize: 12,
-                            fontWeight:
-                                isSel ? FontWeight.w600 : FontWeight.w400,
+                          _activeFilterLabel(),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontWeight: FontWeight.w700,
+                            fontSize: 14,
                           ),
                         ),
                       ),
-                    ),
-                  );
-                },
-              ),
-            ),
-          Expanded(
-            child: loading
-                ? const Center(child: CircularProgressIndicator())
-                : products.isEmpty
-                    ? const Center(
-                        child: Text('Aucun produit dans cette categorie'),
-                      )
-                    : GridView.builder(
-                        controller: _gridScrollController,
-                        cacheExtent: 900,
-                        padding: const EdgeInsets.all(8),
-                        gridDelegate:
-                            const SliverGridDelegateWithFixedCrossAxisCount(
-                          crossAxisCount: 4,
-                          crossAxisSpacing: 8,
-                          mainAxisSpacing: 8,
-                          childAspectRatio: 0.7,
+                      Text(
+                        '${products.length}',
+                        style: TextStyle(
+                          color: Colors.grey.shade700,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
                         ),
-                        itemCount: products.length,
-                        itemBuilder: (context, idx) {
-                          final p = products[idx];
-                          final media = p['media_url']?.toString() ?? '';
-                          final resolvedMedia = resolveMediaUrl(media);
-                          final rawVariants = p['video_variants'];
-                          final variants = rawVariants is Map
-                              ? Map<String, dynamic>.from(rawVariants)
-                              : null;
-                          final rawThumb =
-                              p['thumbnail_url'] ?? p['thumbnail_path'];
-                          final thumbnailUrl =
-                              rawThumb != null && rawThumb.toString().isNotEmpty
-                                  ? resolveMediaUrl(rawThumb.toString())
-                                  : null;
-                          final isVideo = p['media_type'] == 'video' ||
-                              p['is_video'] == true ||
-                              p['is_video']?.toString() == 'true';
-                          final title = (p['description'] ?? '').toString();
+                      ),
+                    ],
+                  ),
+                ),
+                if (subcategories.isNotEmpty)
+                  SizedBox(
+                    height: 48,
+                    child: ListView.separated(
+                      scrollDirection: Axis.horizontal,
+                      itemCount: subcategories.length + 1,
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                      separatorBuilder: (_, __) => const SizedBox(width: 8),
+                      itemBuilder: (context, i) {
+                        final bool isAll = i == 0;
+                        final sid = isAll
+                            ? 'all'
+                            : (subcategories[i - 1]['slug'] ?? '').toString();
+                        final label = isAll
+                            ? 'Tous'
+                            : (subcategories[i - 1]['label'] ??
+                                    subcategories[i - 1]['slug'] ??
+                                    '')
+                                .toString();
+                        final isSel = sid == selectedSubcategory;
 
-                          return GestureDetector(
-                            key: ValueKey('catalog_item_${p['id']}'),
-                            onTap: () {
-                              Navigator.push(
-                                context,
-                                MaterialPageRoute(
-                                  builder: (_) => CatalogFullscreenFeedViewerPage(
-                                    products: products,
-                                    initialIndex: idx,
-                                  ),
-                                ),
-                              );
-                            },
-                            child: ClipRRect(
-                              borderRadius: BorderRadius.circular(8),
-                              child: RepaintBoundary(
-                                child: GridTile(
-                                footer: Container(
-                                  color: Colors.black54,
-                                  padding: const EdgeInsets.symmetric(
-                                      horizontal: 6, vertical: 4),
-                                  child: Text(
-                                    title,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: const TextStyle(
-                                      color: Colors.white,
-                                      fontSize: 12,
-                                    ),
-                                  ),
-                                ),
-                                child: isVideo
-                                    ? VideoPreviewTile(
-                                        key: ValueKey('catalog_video_${p['id']}'),
-                                        mediaPath: media,
-                                        variants: variants,
-                                        thumbnailUrl: thumbnailUrl,
-                                      )
-                                    : CachedNetworkImage(
-                                        imageUrl: resolvedMedia,
-                                        fit: BoxFit.cover,
-                                        placeholder: (_, __) => const Center(
-                                          child: CircularProgressIndicator(
-                                              strokeWidth: 2),
-                                        ),
-                                        errorWidget: (_, __, ___) => Container(
-                                          color: Colors.grey.shade300,
-                                          child: const Icon(Icons.broken_image),
-                                        ),
-                                      ),
+                        return GestureDetector(
+                          onTap: () => _loadProductsFor(
+                            selectedCategory,
+                            subcategory: sid,
+                          ),
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 12,
+                              vertical: 7,
+                            ),
+                            decoration: BoxDecoration(
+                              color: isSel
+                                  ? Colors.deepPurple.shade400
+                                  : Colors.white,
+                              borderRadius: BorderRadius.circular(20),
+                              border: Border.all(
+                                color: isSel
+                                    ? Colors.deepPurple.shade400
+                                    : Colors.grey.shade300,
+                              ),
+                            ),
+                            child: Center(
+                              child: Text(
+                                label,
+                                style: TextStyle(
+                                  color: isSel ? Colors.white : Colors.black87,
+                                  fontSize: 12,
+                                  fontWeight:
+                                      isSel ? FontWeight.w600 : FontWeight.w400,
                                 ),
                               ),
                             ),
-                          );
-                        },
-                      ),
-          ),
-        ],
-      ),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                Expanded(
+                  child: RefreshIndicator(
+                    onRefresh: _refreshCurrentView,
+                    child: loading
+                        ? _buildLoadingGrid()
+                        : products.isEmpty
+                            ? ListView(
+                                physics: const AlwaysScrollableScrollPhysics(),
+                                children: const [
+                                  SizedBox(height: 120),
+                                  Center(
+                                    child: Text(
+                                      'Aucun produit dans cette categorie',
+                                    ),
+                                  ),
+                                ],
+                              )
+                            : LayoutBuilder(
+                                builder: (context, constraints) {
+                                  final crossAxisCount =
+                                      constraints.maxWidth < 430 ? 3 : 4;
+                                  return GridView.builder(
+                                    controller: _gridScrollController,
+                                    cacheExtent: 900,
+                                    padding: const EdgeInsets.all(8),
+                                    physics: const AlwaysScrollableScrollPhysics(),
+                                    gridDelegate:
+                                        SliverGridDelegateWithFixedCrossAxisCount(
+                                      crossAxisCount: crossAxisCount,
+                                      crossAxisSpacing: 8,
+                                      mainAxisSpacing: 8,
+                                      childAspectRatio: 0.7,
+                                    ),
+                                    itemCount: products.length,
+                                    itemBuilder: (context, idx) {
+                                      final p = products[idx];
+                                      final media = p['media_url']?.toString() ?? '';
+                                      final resolvedMedia = resolveMediaUrl(media);
+                                      final rawVariants = p['video_variants'];
+                                      final variants = rawVariants is Map
+                                          ? Map<String, dynamic>.from(rawVariants)
+                                          : null;
+                                      final rawThumb =
+                                          p['thumbnail_url'] ?? p['thumbnail_path'];
+                                      final thumbnailUrl = rawThumb != null &&
+                                              rawThumb.toString().isNotEmpty
+                                          ? resolveMediaUrl(rawThumb.toString())
+                                          : null;
+                                      final isVideo = p['media_type'] == 'video' ||
+                                          p['is_video'] == true ||
+                                          p['is_video']?.toString() == 'true';
+                                      final title =
+                                          (p['description'] ?? '').toString();
+
+                                      return GestureDetector(
+                                        key: ValueKey('catalog_item_${p['id']}'),
+                                        onTap: () {
+                                          Navigator.push(
+                                            context,
+                                            MaterialPageRoute(
+                                              builder: (_) =>
+                                                  CatalogFullscreenFeedViewerPage(
+                                                products: products,
+                                                initialIndex: idx,
+                                              ),
+                                            ),
+                                          );
+                                        },
+                                        child: ClipRRect(
+                                          borderRadius: BorderRadius.circular(8),
+                                          child: RepaintBoundary(
+                                            child: GridTile(
+                                              footer: Container(
+                                                color: Colors.black54,
+                                                padding:
+                                                    const EdgeInsets.symmetric(
+                                                  horizontal: 6,
+                                                  vertical: 4,
+                                                ),
+                                                child: Text(
+                                                  title,
+                                                  maxLines: 1,
+                                                  overflow:
+                                                      TextOverflow.ellipsis,
+                                                  style: const TextStyle(
+                                                    color: Colors.white,
+                                                    fontSize: 12,
+                                                  ),
+                                                ),
+                                              ),
+                                              child: isVideo
+                                                  ? VideoPreviewTile(
+                                                      key: ValueKey(
+                                                        'catalog_video_${p['id']}',
+                                                      ),
+                                                      mediaPath: media,
+                                                      variants: variants,
+                                                      thumbnailUrl: thumbnailUrl,
+                                                    )
+                                                  : CachedNetworkImage(
+                                                      imageUrl: resolvedMedia,
+                                                      fit: BoxFit.cover,
+                                                      placeholder: (_, __) =>
+                                                          const Center(
+                                                        child:
+                                                            CircularProgressIndicator(
+                                                          strokeWidth: 2,
+                                                        ),
+                                                      ),
+                                                      errorWidget: (_, __, ___) =>
+                                                          Container(
+                                                        color:
+                                                            Colors.grey.shade300,
+                                                        child: const Icon(
+                                                          Icons.broken_image,
+                                                        ),
+                                                      ),
+                                                    ),
+                                            ),
+                                          ),
+                                        ),
+                                      );
+                                    },
+                                  );
+                                },
+                              ),
+                  ),
+                ),
+              ],
+            ),
     );
   }
 }
@@ -1418,3 +1768,4 @@ class _CatalogFullscreenFeedViewerPageState
     );
   }
 }
+

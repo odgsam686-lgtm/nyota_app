@@ -1,9 +1,12 @@
 // lib/services/supabase_products_service.dart
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 class SupabaseProductsService {
   final SupabaseClient supabase = Supabase.instance.client;
+
+  String? _viewerId() => FirebaseAuth.instance.currentUser?.uid;
 
   // ============================
   // 🔥 CATÉGORIES & MOTS-CLÉS
@@ -308,19 +311,45 @@ class SupabaseProductsService {
   // ==========================================
   Future<List<Map<String, dynamic>>> fetchCategories() async {
     try {
-      final ranked = await supabase
+      final viewerId = _viewerId();
+      dynamic query = supabase
           .from('catalogue_ranked_posts_mv')
-          .select('category');
+          .select('user_id,category,total_score');
+      if (viewerId != null && viewerId.isNotEmpty) {
+        query = query.eq('user_id', viewerId);
+      }
+      var ranked = List<Map<String, dynamic>>.from(await query);
+
+      // Cold-start fallback: if the personalized slice is empty, use global rows.
+      if (ranked.isEmpty && viewerId != null && viewerId.isNotEmpty) {
+        ranked = List<Map<String, dynamic>>.from(await supabase
+            .from('catalogue_ranked_posts_mv')
+            .select('user_id,category,total_score'));
+      }
       final counts = <String, int>{};
+      final sumScores = <String, double>{};
       for (final row in ranked) {
         final rawCategory = (row['category'] ?? '').toString().trim();
         if (rawCategory.isEmpty) continue;
         counts[rawCategory] = (counts[rawCategory] ?? 0) + 1;
+        final score =
+            double.tryParse((row['total_score'] ?? '0').toString()) ?? 0;
+        sumScores[rawCategory] = (sumScores[rawCategory] ?? 0) + score;
       }
 
       if (counts.isNotEmpty) {
         final sorted = counts.entries.toList()
-          ..sort((a, b) => b.value.compareTo(a.value));
+          ..sort((a, b) {
+            final aSlug = a.key.toLowerCase();
+            final bSlug = b.key.toLowerCase();
+            if (aSlug == 'divers' && bSlug != 'divers') return -1;
+            if (bSlug == 'divers' && aSlug != 'divers') return 1;
+            final aAvg = (sumScores[a.key] ?? 0) / (a.value == 0 ? 1 : a.value);
+            final bAvg = (sumScores[b.key] ?? 0) / (b.value == 0 ? 1 : b.value);
+            final byScore = bAvg.compareTo(aAvg);
+            if (byScore != 0) return byScore;
+            return b.value.compareTo(a.value);
+          });
         return [
           {'slug': 'all', 'label': 'Tous les produits'},
           ...sorted.map((e) {
@@ -328,6 +357,7 @@ class SupabaseProductsService {
             return {
               'slug': slug,
               'label': categoryLabels[slug] ?? _humanizeCategory(slug),
+              'count': e.value,
             };
           }),
         ];
@@ -371,25 +401,37 @@ class SupabaseProductsService {
     int? limit,
     int offset = 0,
   }) async {
-    dynamic query = supabase
-        .from('catalogue_ranked_posts_mv')
-        .select('post_id, category, total_score, jitter');
+    Future<List<Map<String, dynamic>>> runRankedQuery({String? viewerId}) async {
+      dynamic query = supabase
+          .from('catalogue_ranked_posts_mv')
+          .select('post_id, user_id, category, total_score, jitter');
 
-    if (category != null && category != 'all') {
-      query = query.eq('category', category);
+      if (viewerId != null && viewerId.isNotEmpty) {
+        query = query.eq('user_id', viewerId);
+      }
+      if (category != null && category != 'all') {
+        query = query.eq('category', category);
+      }
+
+      query = query
+          .order('total_score', ascending: false)
+          .order('jitter', ascending: false)
+          .order('post_id', ascending: false);
+
+      if (limit != null && limit > 0) {
+        query = query.range(offset, offset + limit - 1);
+      }
+
+      return List<Map<String, dynamic>>.from(await query);
     }
 
-    query = query
-        .order('total_score', ascending: false)
-        .order('jitter', ascending: false)
-        .order('post_id', ascending: false);
+    final viewerId = _viewerId();
+    var rankedRows = await runRankedQuery(viewerId: viewerId);
 
-    if (limit != null && limit > 0) {
-      query = query.range(offset, offset + limit - 1);
+    // Cold-start fallback: if user slice is empty, keep catalogue non-empty.
+    if (rankedRows.isEmpty && viewerId != null && viewerId.isNotEmpty) {
+      rankedRows = await runRankedQuery();
     }
-
-    final rankedRaw = await query;
-    var rankedRows = List<Map<String, dynamic>>.from(rankedRaw);
     if (rankedRows.isEmpty) return [];
 
     var postIds = rankedRows

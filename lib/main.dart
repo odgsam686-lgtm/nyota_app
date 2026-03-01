@@ -48,10 +48,31 @@ final GlobalKey<NavigatorState> appNavigatorKey = GlobalKey<NavigatorState>();
 final GlobalKey<ScaffoldMessengerState> appScaffoldMessengerKey =
     GlobalKey<ScaffoldMessengerState>();
 
-bool _isSupabaseRealtimeTimeoutError(Object error) {
+bool _isSupabaseRealtimeTransientError(Object error) {
   final text = error.toString();
-  return text.contains('RealtimeSubscribeException') &&
-      text.contains('RealtimeSubscribeStatus.timedOut');
+  if (!text.contains('RealtimeSubscribeException')) return false;
+  return text.contains('RealtimeSubscribeStatus.timedOut') ||
+      text.contains('RealtimeSubscribeStatus.channelError');
+}
+
+bool _isTransientNetworkError(Object error) {
+  final text = error.toString();
+  return text.contains('Failed host lookup') ||
+      text.contains('No address associated with hostname') ||
+      text.contains('SocketException') ||
+      text.contains('firebase_auth/network-request-failed');
+}
+
+bool _isImageDecodeError(Object error) {
+  return error
+      .toString()
+      .contains('Invalid image data. Error thrown resolving an image codec');
+}
+
+bool _isVideoPlaybackSourceError(Object error) {
+  final text = error.toString();
+  return text.contains('PlatformException(VideoError') &&
+      text.contains('ExoPlaybackException: Source error');
 }
 
 Future<void> _recordCrashlyticsError(
@@ -59,14 +80,44 @@ Future<void> _recordCrashlyticsError(
   StackTrace stack, {
   bool fatal = true,
 }) async {
-  if (_isSupabaseRealtimeTimeoutError(error)) {
+  if (_isSupabaseRealtimeTransientError(error)) {
     await FirebaseCrashlytics.instance.recordError(
       error,
       stack,
       fatal: false,
-      reason: 'supabase_realtime_subscribe_timeout',
+      reason: 'supabase_realtime_subscribe_transient',
     );
-    debugPrint('Supabase realtime subscribe timeout (non-fatal): $error');
+    debugPrint('Supabase realtime subscribe transient (non-fatal): $error');
+    return;
+  }
+  if (_isTransientNetworkError(error)) {
+    await FirebaseCrashlytics.instance.recordError(
+      error,
+      stack,
+      fatal: false,
+      reason: 'transient_network_error',
+    );
+    debugPrint('Transient network error (non-fatal): $error');
+    return;
+  }
+  if (_isImageDecodeError(error)) {
+    await FirebaseCrashlytics.instance.recordError(
+      error,
+      stack,
+      fatal: false,
+      reason: 'image_decode_error',
+    );
+    debugPrint('Image decode error (non-fatal): $error');
+    return;
+  }
+  if (_isVideoPlaybackSourceError(error)) {
+    await FirebaseCrashlytics.instance.recordError(
+      error,
+      stack,
+      fatal: false,
+      reason: 'video_source_error',
+    );
+    debugPrint('Video source error (non-fatal): $error');
     return;
   }
   await FirebaseCrashlytics.instance.recordError(error, stack, fatal: fatal);
@@ -85,17 +136,7 @@ void main() async {
       FlutterError.onError = (FlutterErrorDetails details) {
         final error = details.exception;
         final stack = details.stack ?? StackTrace.current;
-        if (_isSupabaseRealtimeTimeoutError(error)) {
-          FirebaseCrashlytics.instance.recordError(
-            error,
-            stack,
-            fatal: false,
-            reason: 'supabase_realtime_subscribe_timeout',
-          );
-          debugPrint('Supabase realtime subscribe timeout (non-fatal): $error');
-          return;
-        }
-        FirebaseCrashlytics.instance.recordFlutterFatalError(details);
+        unawaited(_recordCrashlyticsError(error, stack, fatal: true));
       };
       PlatformDispatcher.instance.onError = (error, stack) {
         _recordCrashlyticsError(error, stack, fatal: true);
@@ -412,6 +453,7 @@ class _LoginPageState extends State<LoginPage> {
       return;
     }
 
+    if (!mounted) return;
     setState(() => isLoading = true);
 
    try {
@@ -536,9 +578,11 @@ if (res.status != 200) {
               Navigator.pop(ctx);
               try {
                 await FirebaseAuth.instance.sendPasswordResetEmail(email: e);
+                if (!mounted) return;
                 ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
                     content: Text('Email de réinitialisation envoyé')));
               } on FirebaseAuthException catch (err) {
+                if (!mounted) return;
                 ScaffoldMessenger.of(context).showSnackBar(
                     SnackBar(content: Text(err.message ?? 'Erreur')));
               }
@@ -807,13 +851,17 @@ class _RegisterPageState extends State<RegisterPage> {
         'is_seller': false,
       });
 
+      if (!mounted) return;
       Navigator.pop(context);
     } catch (e) {
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Erreur : $e')),
       );
     } finally {
-      setState(() => isLoading = false);
+      if (mounted) {
+        setState(() => isLoading = false);
+      }
     }
   }
 

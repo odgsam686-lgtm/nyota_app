@@ -14,8 +14,6 @@ import 'package:nyota_app/services/video_thumbnail_service.dart';
 import 'package:nyota_app/services/notification_service.dart';
 import 'package:nyota_app/services/crashlytics_logger.dart';
 
-final ScrollController _scrollController = ScrollController();
-
 class ChatScreen extends StatefulWidget {
   final String conversationId;
   final String receiverId;
@@ -39,6 +37,7 @@ class ChatScreen extends StatefulWidget {
 class _ChatScreenState extends State<ChatScreen> {
   final supabase = Supabase.instance.client;
   final TextEditingController _controller = TextEditingController();
+  final ScrollController _scrollController = ScrollController();
   late final String currentUserId;
   int _lastMessageCount = 0;
   final List<Map<String, dynamic>> _localMessages = [];
@@ -534,6 +533,7 @@ class _ChatScreenState extends State<ChatScreen> {
   void dispose() {
     _draftTimer?.cancel();
     _pendingVideoController?.dispose();
+    _scrollController.dispose();
     _setTyping(false);
     NotificationService.instance.setActiveConversationId(null);
     super.dispose();
@@ -695,11 +695,16 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   void _scrollToBottom() {
-    if (_scrollController.hasClients) {
-      _scrollController.jumpTo(
-        _scrollController.position.maxScrollExtent,
-      );
-    }
+    final max = _safeMaxScrollExtent();
+    if (max == null) return;
+    _scrollController.jumpTo(max);
+  }
+
+  double? _safeMaxScrollExtent() {
+    if (!_scrollController.hasClients) return null;
+    final positions = _scrollController.positions;
+    if (positions.isEmpty) return null;
+    return positions.last.maxScrollExtent;
   }
 
   String _formatTime(String iso) {
@@ -896,9 +901,10 @@ class _ChatScreenState extends State<ChatScreen> {
                     if (messages.length != _lastMessageCount) {
                       _lastMessageCount = messages.length;
 
-                      if (_scrollController.hasClients) {
+                      final max = _safeMaxScrollExtent();
+                      if (max != null) {
                         _scrollController.animateTo(
-                          _scrollController.position.maxScrollExtent,
+                          max,
                           duration: const Duration(milliseconds: 300),
                           curve: Curves.easeOut,
                         );
