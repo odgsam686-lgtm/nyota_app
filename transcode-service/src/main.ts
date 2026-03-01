@@ -110,15 +110,74 @@ async function fetchWithRetry(
   throw new Error("fetchWithRetry exhausted");
 }
 
-function normalizeObjectName(bucket: string, sourceName: string) {
-  if (bucket === "posts") {
-    let n = sourceName;
-    while (n.startsWith("posts/")) {
-      n = n.substring("posts/".length);
-    }
-    return n;
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function buildStorageObjectName(bucket: string, sourceName: string) {
+  if (!sourceName) return sourceName;
+  let name = sourceName.trim();
+
+  if (name.startsWith("http://") || name.startsWith("https://")) {
+    try {
+      const u = new URL(name);
+      name = `${u.pathname}${u.search}`;
+      const marker = "/storage/v1/object/";
+      const idx = u.pathname.indexOf(marker);
+      if (idx >= 0) {
+        let suffix = u.pathname.substring(idx + marker.length);
+        if (suffix.startsWith("public/")) {
+          suffix = suffix.substring("public/".length);
+        }
+        if (suffix.startsWith("sign/")) {
+          // signed URL pattern: sign/<bucket>/<object_name>
+          suffix = suffix.substring("sign/".length);
+        }
+        name = suffix;
+      }
+    } catch {}
   }
-  return sourceName;
+
+  const qIdx = name.indexOf("?");
+  if (qIdx >= 0) {
+    name = name.substring(0, qIdx);
+  }
+
+  if (name.startsWith("/")) name = name.substring(1);
+  if (name.startsWith("public/")) name = name.substring("public/".length);
+  if (name.startsWith(`${bucket}/${bucket}/`)) {
+    name = name.substring(bucket.length + 1);
+  }
+
+  if (bucket === "posts") {
+    if (name.startsWith("messages/")) return name;
+    if (!name.startsWith("posts/")) return `posts/${name}`;
+  }
+
+  return name;
+}
+
+function buildStorageCandidates(bucket: string, sourceName: string) {
+  const candidates: string[] = [];
+  const primary = buildStorageObjectName(bucket, sourceName);
+  if (primary) candidates.push(primary);
+
+  const raw = sourceName.trim().replace(/^\/+/, "").replace(/\?.*$/, "");
+  if (raw) {
+    candidates.push(raw);
+    if (raw.startsWith(`${bucket}/`)) {
+      candidates.push(raw.substring(bucket.length + 1));
+    } else {
+      candidates.push(`${bucket}/${raw}`);
+    }
+  }
+
+  const seen = new Set<string>();
+  return candidates.filter((item) => {
+    if (!item || seen.has(item)) return false;
+    seen.add(item);
+    return true;
+  });
 }
 
 function shouldIgnore(name: string) {
@@ -149,6 +208,46 @@ async function createSignedUrl(bucket: string, objectName: string) {
     throw error ?? new Error("Signed URL error");
   }
   return data.signedUrl;
+}
+
+async function resolveObjectAndSignedUrl(
+  bucket: string,
+  sourceName: string,
+  ctx: { requestId?: string; jobId?: string } = {},
+) {
+  const candidates = buildStorageCandidates(bucket, sourceName);
+  if (candidates.length === 0) {
+    throw new Error(`No storage object candidate from sourceName=${sourceName}`);
+  }
+
+  let lastError: unknown = null;
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
+    for (const candidate of candidates) {
+      try {
+        const signedUrl = await createSignedUrl(bucket, candidate);
+        logStep(ctx, "resolve_object_ok", { sourceName, candidate, attempt });
+        return { objectName: candidate, signedUrl };
+      } catch (e) {
+        lastError = e;
+        logStep(ctx, "resolve_object_miss", {
+          sourceName,
+          candidate,
+          attempt,
+          error: String((e as any)?.message ?? e),
+        });
+      }
+    }
+    if (attempt < 4) {
+      await sleep(attempt * 500);
+    }
+  }
+
+  const message = `Object not found in storage. bucket=${bucket} source=${sourceName} candidates=${candidates.join(
+    " | ",
+  )}`;
+  const err = new Error(message);
+  (err as any).cause = lastError;
+  throw err;
 }
 
 async function uploadObject(
@@ -206,17 +305,20 @@ async function runTranscode(
   if (shouldIgnore(sourceName)) return;
   if (!isLikelyVideo(sourceName, contentType)) return;
 
-  const objectName = normalizeObjectName(bucket, sourceName);
-  log("SOURCE", sourceName, "OBJECT", objectName);
+  const normalizedObjectName = buildStorageObjectName(bucket, sourceName);
+  log("SOURCE", sourceName, "OBJECT_NORMALIZED", normalizedObjectName);
   logStep(ctx, "download_start");
 
+  let objectName = normalizedObjectName;
   let signedUrl: string;
   try {
-    log("STEP 1: createSignedUrl start");
-    signedUrl = await createSignedUrl(bucket, objectName);
-    log("STEP 2: createSignedUrl done");
+    log("STEP 1: resolve object + signed url start");
+    const resolved = await resolveObjectAndSignedUrl(bucket, sourceName, ctx);
+    objectName = resolved.objectName;
+    signedUrl = resolved.signedUrl;
+    log("STEP 2: resolve object + signed url done", { objectName });
   } catch (e: any) {
-    log("STEP 2B: createSignedUrl failed");
+    log("STEP 2B: resolve object + signed url failed");
     console.error(e?.stack);
     console.error(e?.cause);
     throw e;
@@ -270,6 +372,7 @@ async function runTranscode(
   logStep(ctx, "db_update_ok");
 
   rmSync(workDir, { recursive: true, force: true });
+  return objectName;
 }
 
 async function enqueueJob(bucket: string, objectName: string) {
@@ -331,9 +434,18 @@ async function workerLoop() {
       });
 
       logStep({ jobId: job.id }, "webhook_received");
-      await runTranscode(job.bucket, job.object_name, undefined, { jobId: job.id });
+      const resolvedObjectName = await runTranscode(
+        job.bucket,
+        job.object_name,
+        undefined,
+        { jobId: job.id },
+      );
 
-      await updateJob(job.id, { status: "done", error: null });
+      await updateJob(job.id, {
+        status: "done",
+        error: null,
+        object_name: resolvedObjectName,
+      });
     } catch (e: any) {
       logStep({ jobId: job?.id }, "job_failed", e?.message || e);
       console.error(e);
@@ -458,7 +570,7 @@ const server = http.createServer(async (req, res) => {
 
     res.writeHead(202).end("accepted");
 
-    const objectName = normalizeObjectName(bucket, sourceName);
+    const objectName = buildStorageObjectName(bucket, sourceName);
     const ctx = { requestId };
 
     if (MODE === "direct") {
@@ -470,6 +582,8 @@ const server = http.createServer(async (req, res) => {
       });
     } else {
       setImmediate(() => {
+        log("[WEBHOOK] upload path", { bucket, uploadPath: sourceName });
+        log("[WEBHOOK] enqueue", { bucket, object_name: objectName, uploadPath: sourceName });
         enqueueJob(bucket, objectName)
           .then(() => log("[WEBHOOK] job enqueued", { requestId }))
           .catch((e) => {
